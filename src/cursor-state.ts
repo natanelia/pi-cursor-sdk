@@ -1,3 +1,4 @@
+import { isCursorLeanEnabled } from "./cursor-lean.js";
 import type { AgentModeOption } from "@cursor/sdk";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import {
@@ -18,6 +19,7 @@ import {
 	buildCursorPiToolBridgeSnapshot,
 	CURSOR_PI_TOOL_BRIDGE_ENV,
 	resolveCursorPiToolBridgeEnabled,
+	resolveCursorPiToolBridgeBuiltinsEnabled,
 } from "./cursor-pi-tool-bridge-snapshot.js";
 import {
 	CURSOR_SETTING_SOURCES_ENV,
@@ -386,13 +388,15 @@ export function formatCursorToolsDebugReport(
 		"Cursor tool surfaces (current session):",
 		`${CURSOR_PI_TOOL_BRIDGE_ENV}: ${bridgeEnabled ? "enabled" : "disabled"}`,
 		`${CURSOR_TOOL_MANIFEST_ENV}: ${manifestEnabled ? "enabled" : "disabled"}`,
-		`${CURSOR_SETTING_SOURCES_ENV}: ${formatEffectiveCursorSettingSourcesLabel(env[CURSOR_SETTING_SOURCES_ENV])}`,
+		`${CURSOR_SETTING_SOURCES_ENV}: ${isCursorLeanEnabled(env) ? "none (PI_CURSOR_LEAN=1)" : formatEffectiveCursorSettingSourcesLabel(env[CURSOR_SETTING_SOURCES_ENV])}`,
 	];
 
 	let bridgeSnapshot;
 	if (bridgeEnabled) {
 		try {
-			bridgeSnapshot = buildCursorPiToolBridgeSnapshot(pi);
+			bridgeSnapshot = buildCursorPiToolBridgeSnapshot(pi, {
+				exposeOverlappingBuiltins: resolveCursorPiToolBridgeBuiltinsEnabled(env),
+			});
 		} catch {
 			lines.push("Pi bridge snapshot: unavailable (extension tool APIs required).");
 		}
