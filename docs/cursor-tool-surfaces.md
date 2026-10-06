@@ -2,6 +2,12 @@
 
 pi-cursor-sdk runs Cursor models through the local `@cursor/sdk` agent runtime by default. A local pi session can expose **three related but different** tool namespaces. This page is the user-facing guide; maintainer replay details live in [Cursor native tool replay](./cursor-native-tool-replay.md).
 
+## Pi-tools-only mode
+
+Lean mode is enabled by default. Only the Pi bridge is callable. Active Pi builtins are included automatically; native Cursor tools (including web search and subagents) and ambient Cursor MCP/settings are disabled. Pi's own instructions and skill catalog remain intact, and the extension does not add replay, question, or skill activation tools. Pi tool toggles control the entire exposed surface. Empty active tools mean no SDK tools.
+
+Lean mode overrides bridge/builtin opt-outs and `PI_CURSOR_SETTING_SOURCES`. It requires local runtime and rejects Cloud. Set `PI_CURSOR_LEAN=0` at startup to restore native tools or use Cloud; restart Pi when changing the flag. See [Pi-tools-only mode](../README.md#pi-tools-only-mode) for setup. The rest of this page describes legacy mode (`PI_CURSOR_LEAN=0`) unless stated otherwise.
+
 ## The three surfaces
 
 | Surface | Who owns it | Callable by Cursor? | What pi shows |
@@ -19,11 +25,12 @@ Pi CLI tool toggles apply at the pi tool-registry boundary. `--no-tools`, `--too
 - **MCP `listTools`** (and pi's MCP catalog when present) lists **MCP servers only** — for example `pi_tools` with `pi__cursor_ask_question`. It does **not** enumerate Cursor SDK host tools such as `Read` or `Shell`.
 - **Bootstrap prompts** include a short **Cursor SDK tool boundary** block plus a compact **callable tool surfaces** manifest by default (disable manifest with `PI_CURSOR_TOOL_MANIFEST=0`). The manifest reminds the model that Cursor host/configured MCP tools are controlled by Cursor, while pi tool toggles only affect pi tools/bridge exposure; when bridge tools are exposed, it lists the current `pi__*` names. MCP `listTools` entries for bridged pi tools point back to the bootstrap prompt instead of repeating the full contract.
 - **Incremental prompts** omit the full boundary block but keep a short tail guard (including an explicit shell `cd` hint); the session agent retains prior bootstrap context. They also omit invariant Pi system instructions; a changed system prompt forces bootstrap with the new section.
+- **CodeMode routing:** when `codemode_execute` is bridged, the bootstrap manifest explains that tools can be callable through CodeMode even without a direct `pi__*` name. If `codemode_search` is also exposed, it directs the model to an exact `bash` lookup for shell access, followed by execution using the returned schema. It asks the model to do routine discovery without narration and reuse schemas already provided. CodeMode's catalog determines availability; a registered but inactive Pi tool is not automatically callable.
 - **In-session debug:** `/cursor-tools` prints bridge enablement, manifest enablement, effective `PI_CURSOR_SETTING_SOURCES`, and the current callable-surface snapshot.
 
 ## Pi bridge vs Cursor native
 
-Default behavior:
+Legacy behavior (`PI_CURSOR_LEAN=0`):
 
 - Cursor host tools handle files, shell, grep, and edits.
 - When exposed, `pi__mcp` is preferred for MCP work and `pi__subagent` is preferred for delegation. Cursor-configured MCP and Cursor-native subagents are fallbacks when the matching pi tool is not exposed or is unavailable.

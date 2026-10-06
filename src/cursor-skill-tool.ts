@@ -1,3 +1,4 @@
+import { isCursorLeanEnabled } from "./cursor-lean.js";
 import type { Dirent } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
@@ -116,7 +117,7 @@ export function resolveCursorSkillSystemPrompt(
 	systemPromptOptions?: BuildSystemPromptOptions,
 	runtime: CursorRuntime = "local",
 ): string {
-	if (!isCursorModel(model)) return systemPrompt;
+	if (isCursorLeanEnabled() || !isCursorModel(model)) return systemPrompt;
 	if (runtime === "cloud") return systemPrompt.replace(AVAILABLE_SKILLS_SECTION_PATTERN, "");
 	const skills = getVisibleSkills(systemPromptOptions?.skills);
 	if (skills.length === 0) return systemPrompt;
@@ -190,6 +191,7 @@ function wrapSkillContent(skill: Skill, content: string, resources: readonly str
 }
 
 export function registerCursorSkillTool(pi: CursorSkillToolExtensionApi): void {
+	if (isCursorLeanEnabled()) return;
 	pi.registerTool({
 		name: CURSOR_ACTIVATE_SKILL_TOOL_NAME,
 		label: "Cursor skill",

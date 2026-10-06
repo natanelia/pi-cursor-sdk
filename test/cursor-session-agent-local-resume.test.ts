@@ -1,5 +1,5 @@
 import { toNamespacedPath } from "node:path";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { computeCursorContextFingerprint } from "../src/context.js";
 import { __testUtils as cursorSessionScopeTestUtils } from "../src/cursor-session-scope.js";
 import { __testUtils as resumeTestUtils } from "../src/cursor-session-agent-resume.js";
@@ -12,6 +12,7 @@ import { installCursorSessionStoreMock } from "./helpers/cursor-session-store.js
 import { buildCursorSessionStateRoot } from "../src/cursor-session-store.js";
 
 describe("cursor-session-agent local resume", () => {
+	afterEach(() => vi.unstubAllEnvs());
 	beforeEach(async () => {
 		installCursorSessionStoreMock();
 		cursorSessionScopeTestUtils.reset();
@@ -20,7 +21,8 @@ describe("cursor-session-agent local resume", () => {
 		vi.clearAllMocks();
 	});
 
-	it("resumes a recorded local SDK agent from its versioned session store", async () => {
+	it.each([false, true])("resumes a recorded local SDK agent from its versioned session store (lean=%s)", async (lean) => {
+		vi.stubEnv("PI_CURSOR_LEAN", lean ? "1" : "0");
 		const storeMock = installCursorSessionStoreMock();
 		const scopeKey = "/tmp/sessions/test.jsonl";
 		const stateRoot = buildCursorSessionStateRoot("/tmp/cursor-sdk-state", scopeKey, true);
@@ -83,6 +85,8 @@ describe("cursor-session-agent local resume", () => {
 			}),
 		);
 		expect(createAgent).not.toHaveBeenCalled();
+		expect(resumeAgent.mock.calls[0][1].tools).toEqual(lean ? [] : undefined);
+		if (lean) expect(resumeAgent.mock.calls[0][1].local.settingSources).toEqual([]);
 	});
 
 	it("resumes a legacy default-store agent before force-creating its session-store replacement", async () => {
