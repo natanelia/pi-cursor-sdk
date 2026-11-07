@@ -26,9 +26,11 @@ describe("Cursor session agent HTTP/1.1 pooling", () => {
 
 	it("clears extension-owned SDK transport after agent disposal on reload", async () => {
 		const configure = vi.fn<(options: CursorConfigureOptions) => void>();
+		const enteredDispose = Promise.withResolvers<void>();
 		let finishDispose: (() => void) | undefined;
 		const dispose = vi.fn(() => new Promise<void>((resolve) => {
 			finishDispose = resolve;
+			enteredDispose.resolve();
 		}));
 		const createAgent = vi.fn().mockResolvedValue({
 			agentId: "agent-http1-reload",
@@ -37,6 +39,7 @@ describe("Cursor session agent HTTP/1.1 pooling", () => {
 		const pi = createEventHarness();
 		registerCursorSessionAgentLifecycle(pi);
 		cursorSessionScopeTestUtils.set("/tmp/project", "/tmp/sessions/test.jsonl");
+		await pi.runSessionStart({ cwd: "/tmp/project", sessionManager: { getSessionFile: () => "/tmp/sessions/test.jsonl" } });
 		configureCursorSdkHttp1(
 			{ Cursor: { configure } },
 			{ value: true, source: "environment", trustLevel: "environment" },
@@ -51,7 +54,8 @@ describe("Cursor session agent HTTP/1.1 pooling", () => {
 		});
 
 		const shutdown = pi.runSessionShutdown({ reason: "reload" });
-		await vi.waitFor(() => expect(dispose).toHaveBeenCalledTimes(1));
+		await enteredDispose.promise;
+		expect(dispose).toHaveBeenCalledTimes(1);
 		expect(configure).toHaveBeenCalledTimes(1);
 		finishDispose?.();
 		await shutdown;
@@ -67,32 +71,31 @@ describe("Cursor session agent HTTP/1.1 pooling", () => {
 		);
 	});
 
-	it("splits default, HTTP/2, and HTTP/1.1 pool keys", () => {
-		const baseParams = {
-			apiKey: "test-key",
-			agentMode: "agent" as const,
-			cwd: "/tmp/project",
-			modelSelection: { id: "composer-2.5" },
-		};
-		const poolKeys = [
-			sessionAgentTestUtils.buildSessionAgentPoolKey("scope", baseParams),
-			sessionAgentTestUtils.buildSessionAgentPoolKey("scope", {
-				...baseParams,
-				useHttp1ForAgent: false,
-			}),
-			sessionAgentTestUtils.buildSessionAgentPoolKey("scope", {
-				...baseParams,
-				useHttp1ForAgent: true,
-			}),
-		];
-
-		expect(new Set(poolKeys).size).toBe(3);
+	it("does not reuse an agent across default, HTTP/2, and HTTP/1.1 transport selections", async () => {
+		const createAgent = vi.fn().mockImplementation(async () => ({
+			agentId: `agent-${createAgent.mock.calls.length}`,
+			[Symbol.asyncDispose]: vi.fn().mockResolvedValue(undefined),
+		}));
+		cursorSessionScopeTestUtils.set("/tmp/project", "/tmp/sessions/transport.jsonl");
+		const params = { apiKey: "test-key", agentMode: "agent" as const, cwd: "/tmp/project",
+			modelSelection: { id: "composer-2.5" }, createAgent };
+		const leases = [];
+		for (const useHttp1ForAgent of [undefined, false, true]) {
+			const lease = await acquireSessionCursorAgent({ ...params, useHttp1ForAgent });
+			const reused = await acquireSessionCursorAgent({ ...params, useHttp1ForAgent });
+			expect(reused.agent).toBe(lease.agent);
+			leases.push(lease);
+		}
+		expect(new Set(leases.map(lease => lease.agent)).size).toBe(3);
+		expect(createAgent).toHaveBeenCalledTimes(3);
 	});
 
 	it("disposes the previous transport pool before creating its replacement", async () => {
+		const enteredDispose = Promise.withResolvers<void>();
 		let finishDispose: (() => void) | undefined;
 		const firstDispose = vi.fn(() => new Promise<void>((resolve) => {
 			finishDispose = resolve;
+			enteredDispose.resolve();
 		}));
 		const createAgent = vi.fn().mockImplementation(async () => ({
 			agentId: `agent-${createAgent.mock.calls.length}`,
@@ -111,7 +114,8 @@ describe("Cursor session agent HTTP/1.1 pooling", () => {
 		await acquireSessionCursorAgent({ ...params, useHttp1ForAgent: true });
 
 		const replacement = acquireSessionCursorAgent({ ...params, useHttp1ForAgent: false });
-		await vi.waitFor(() => expect(firstDispose).toHaveBeenCalledTimes(1));
+		await enteredDispose.promise;
+		expect(firstDispose).toHaveBeenCalledTimes(1);
 		expect(createAgent).toHaveBeenCalledTimes(1);
 
 		finishDispose?.();

@@ -4,12 +4,17 @@ import {
 	installCursorSdkSessionProcessErrorGuard,
 } from "../src/cursor-sdk-process-error-guard.js";
 
+const emitProcessEvent = (event: string | symbol, ...args: unknown[]): boolean =>
+	(process.emit as (event: string | symbol, ...args: unknown[]) => boolean).call(process, event, ...args);
+
+// Synthetic inputs use retained .35 offline harness frames with normalized repo
+// prefixes; Ho's line 5 is harness-relative, not an installed-source location.
 function makeCursorSdkStalledRepeatedlyRetriableError(): Error {
 	const error = new Error("Connection stalled repeatedly");
 	error.name = "RetriableError";
 	error.stack =
 		"RetriableError: Connection stalled repeatedly\n" +
-		"    at fe (/repo/node_modules/@cursor/sdk/dist/esm/357.js:1:62073)";
+		"    at Ho (/repo/node_modules/@cursor/sdk/dist/esm/689.js:5:99)";
 	return error;
 }
 
@@ -17,8 +22,8 @@ function makeCursorSdkRawAbortDomException(): DOMException {
 	const error = new DOMException("This operation was aborted", "AbortError");
 	error.stack =
 		"AbortError: This operation was aborted\n" +
-		"    at AbortSignal.abort (/repo/node_modules/@cursor/sdk/dist/esm/996.js:1:5705)\n" +
-		"    at Y.onStall (/repo/node_modules/@cursor/sdk/dist/esm/357.js:1:75246)";
+		"    at AbortSignal.l (file:///repo/node_modules/@cursor/sdk/dist/esm/769.js:1:13744)\n" +
+		"    at Object.onStall (/repo/node_modules/@cursor/sdk/dist/esm/689.js:1:111574)";
 	return error;
 }
 
@@ -27,7 +32,7 @@ function makeCursorSdkRawAbortError(): Error {
 	error.name = "AbortError";
 	error.stack =
 		"AbortError: This operation was aborted\n" +
-		"    at abort (/repo/node_modules/@cursor/sdk/dist/esm/index.js:1:1125976)";
+		"    at AbortSignal.l (file:///repo/node_modules/@cursor/sdk/dist/esm/769.js:1:13744)";
 	return error;
 }
 
@@ -36,8 +41,8 @@ function processListenerCalled(event: "uncaughtException" | "unhandledRejection"
 	const listener = () => { called = true; };
 	process.once(event, listener);
 	try {
-		if (event === "uncaughtException") process.emit(event, error as Error, "uncaughtException");
-		else process.emit(event, error, Promise.resolve());
+		if (event === "uncaughtException") emitProcessEvent(event, error as Error, "uncaughtException");
+		else emitProcessEvent(event, error, Promise.resolve());
 		return called;
 	} finally {
 		process.removeListener(event, listener);
@@ -45,21 +50,14 @@ function processListenerCalled(event: "uncaughtException" | "unhandledRejection"
 }
 
 describe("Cursor SDK raw AbortError process guard", () => {
-	it("suppresses a DOMException during a provider turn that declares abort suppression", () => {
+	it.each([
+		{ label: "the unhandledRejection path", event: "unhandledRejection", makeError: makeCursorSdkRawAbortDomException },
+		{ label: "a plain Error variant with Cursor SDK provenance", event: "uncaughtException", makeError: makeCursorSdkRawAbortError },
+	] as const)("suppresses $label", ({ event, makeError }) => {
 		const guard = installCursorSdkProcessErrorGuard();
 		guard.suppressAbortErrors();
 		try {
-			expect(processListenerCalled("uncaughtException", makeCursorSdkRawAbortDomException())).toBe(false);
-		} finally {
-			guard.dispose();
-		}
-	});
-
-	it("suppresses the unhandledRejection path", () => {
-		const guard = installCursorSdkProcessErrorGuard();
-		guard.suppressAbortErrors();
-		try {
-			expect(processListenerCalled("unhandledRejection", makeCursorSdkRawAbortDomException())).toBe(false);
+			expect(processListenerCalled(event, makeError())).toBe(false);
 		} finally {
 			guard.dispose();
 		}
@@ -69,16 +67,6 @@ describe("Cursor SDK raw AbortError process guard", () => {
 		const guard = installCursorSdkProcessErrorGuard();
 		try {
 			expect(processListenerCalled("uncaughtException", makeCursorSdkRawAbortDomException())).toBe(false);
-		} finally {
-			guard.dispose();
-		}
-	});
-
-	it("suppresses a plain Error variant with Cursor SDK provenance", () => {
-		const guard = installCursorSdkProcessErrorGuard();
-		guard.suppressAbortErrors();
-		try {
-			expect(processListenerCalled("uncaughtException", makeCursorSdkRawAbortError())).toBe(false);
 		} finally {
 			guard.dispose();
 		}

@@ -1,6 +1,11 @@
-import { expect, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { afterEach, expect, vi } from "vitest";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+	vi.unstubAllGlobals();
+});
 
 // Mock @cursor/sdk before importing the module under test
 vi.mock("@cursor/sdk", () => {
@@ -156,8 +161,6 @@ export async function connectMcpClient(url: string) {
 	return { client, transport };
 }
 
-export const delayBeforeToolCompletion = () => new Promise((resolve) => setTimeout(resolve, 120));
-
 export async function collectEvents(stream: ReturnType<typeof streamCursor>): Promise<AssistantMessageEvent[]> {
 	return collectAssistantEvents(stream);
 }
@@ -237,7 +240,7 @@ export function getCreatedAgentOptions(callIndex = 0): CursorAgentCreateOptions 
 }
 
 export function createMockAgentPlatform(
-	loadLatest = vi.fn().mockResolvedValue(undefined),
+	loadLatest: CursorAgentPlatformForTest["checkpointStore"]["loadLatest"] = vi.fn().mockResolvedValue(undefined),
 ): CursorAgentPlatformForTest {
 	return {
 		checkpointStore: {
@@ -360,6 +363,14 @@ export const cursorModelItems: ModelListItem[] = [
 ];
 
 export async function resetCursorProviderTestState(): Promise<void> {
+	// The SDK mock does not cover direct REST reporting; only the real loopback bridge needs transport.
+	vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input, init) => {
+		const url = new URL(input instanceof Request ? input.url : String(input));
+		if (url.hostname !== "127.0.0.1") {
+			throw new Error("External fetch is disabled in offline provider tests");
+		}
+		return originalFetch(input, init);
+	}));
 	vi.useRealTimers();
 	installCursorSessionStoreMock();
 	cloudLifecycleTestUtils.reset();
@@ -367,7 +378,9 @@ export async function resetCursorProviderTestState(): Promise<void> {
 	registerCursorCloudLifecycleLedger(createPiHarness());
 	await cursorPiToolBridgeTestUtils.resetRegisteredBridgeForTests();
 	vi.clearAllMocks();
+	delete process.env.PI_CURSOR_NATIVE_TOOLS;
 	delete process.env.PI_CURSOR_NATIVE_TOOL_DISPLAY;
+	delete process.env.PI_CURSOR_LIVE_RUN_IDLE_DISPOSE_MS;
 	delete process.env.PI_CURSOR_REGISTER_NATIVE_TOOLS;
 	delete process.env.PI_CURSOR_SETTING_SOURCES;
 	delete process.env.PI_CURSOR_PI_TOOL_BRIDGE;

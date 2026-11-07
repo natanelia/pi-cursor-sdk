@@ -4,18 +4,17 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { TurnEndedUpdateSchema } from "@cursor/sdk";
 import type { AssistantMessage, Context } from "@earendil-works/pi-ai";
+import { calculateContextTokens } from "@earendil-works/pi-coding-agent";
 import {
 	applyCursorUsage,
 	isCursorSdkUsageSafeForPiMessage,
 	readCursorSdkTurnUsageFromUpdate,
 } from "../src/cursor-usage-accounting.js";
-import { readInstalledPackageVersion, resolveInstalledPackageRoot } from "./helpers/installed-package.js";
+import { resolveInstalledPackageRoot } from "./helpers/installed-package.js";
 import { makeModel } from "./helpers/pi-harness.js";
 
 const require = createRequire(import.meta.url);
 const sdkRoot = resolveInstalledPackageRoot("@cursor/sdk");
-const installedSdkVersion = readInstalledPackageVersion("@cursor/sdk");
-
 interface TurnEndedUsageContractFixture {
 	provenance: {
 		sdkPackage: string;
@@ -83,7 +82,6 @@ describe("installed Cursor SDK turn-ended usage contract", () => {
 	it("locks published SDK TokenUsage transform separately from observed raw turn-ended semantics", () => {
 		expect(fixture.provenance.sdkPackage).toBe("@cursor/sdk");
 		expect(fixture.provenance.sdkVersion).toBe("1.0.23");
-		expect(installedSdkVersion).toBe("1.0.27");
 		expect(fixture.provenance.issue).toContain("/issues/196");
 
 		const usageTypes = readFileSync(join(sdkRoot, "dist/esm/usage-types.d.ts"), "utf8");
@@ -131,7 +129,8 @@ describe("installed Cursor SDK turn-ended usage contract", () => {
 			expect(isCursorSdkUsageSafeForPiMessage(turn!, model)).toBe(true);
 
 			const partial = makeAssistantMessage();
-			applyCursorUsage(partial, model, context, 7, { runtime: "local", turn: turn! });
+			// The stale trusted occupancy floor must not override fresh LOCAL turn counts.
+			applyCursorUsage(partial, model, context, 7, { runtime: "local", turn: turn!, occupancyFloor: 100000 });
 			expect(partial.usage).toMatchObject(fixture.expectedPiMappingFromRawTurnEnded[index]!);
 			expect(
 				partial.usage.input + partial.usage.cacheRead + partial.usage.cacheWrite + partial.usage.output,
@@ -144,6 +143,7 @@ describe("installed Cursor SDK turn-ended usage contract", () => {
 				sample.usage.cacheWriteTokens;
 			expect(partial.usage.totalTokens).not.toBe(publishedAdditiveTotal);
 			expect(partial.usage.totalTokens).toBe(sample.usage.inputTokens + sample.usage.outputTokens);
+			expect(calculateContextTokens(partial.usage)).toBe(partial.usage.totalTokens);
 		}
 	});
 });

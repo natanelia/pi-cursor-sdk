@@ -11,6 +11,7 @@ import {
 } from "./artifact-bundle-contract.mjs";
 import { redactSecrets } from "./artifact-secrets.mjs";
 import {
+	scanArtifacts,
 	writeCommand,
 	writeExitCode,
 	writeManifest,
@@ -29,6 +30,12 @@ export function finalizeSuiteArtifacts(
 	summaryData,
 	expectedFiles,
 ) {
+	const malformed = scanArtifacts(suiteDir).filter(({ violation }) => violation.startsWith("invalid JSON"));
+	checks = [...checks, {
+		id: "structured-artifacts-parseable",
+		fn: () => malformed.length === 0,
+		error: malformed.map(({ file, violation }) => `${file}: ${violation}`).join("; "),
+	}];
 	const assertions = runAssertions(suiteDir, checks);
 	writeSummary(suiteDir, { ...summaryData, ok: assertions.ok });
 	const expected = assertions.ok
@@ -80,6 +87,7 @@ export function stopLeaseCheck(stopResult) {
 	};
 }
 
+/** Runs a suite command with Crabbox's full-stdout capture under suiteDir, retrying one transient SSH failure without sync. */
 export async function runOnLeaseWithTransientRetry(
 	suiteDir,
 	targetName,
@@ -88,7 +96,8 @@ export async function runOnLeaseWithTransientRetry(
 	options,
 	run = runOnLease,
 ) {
-	const first = await run(targetName, leaseId, command, options);
+	const captured = { ...options, captureStdoutPath: resolve(suiteDir, ".crabbox.remote.stdout.raw") };
+	const first = await run(targetName, leaseId, command, captured);
 	if (!isTransientCrabboxSshFailure(first)) return first;
 	writeRedactedFile(
 		resolve(suiteDir, "crabbox.retry1.stdout.txt"),
@@ -99,7 +108,7 @@ export async function runOnLeaseWithTransientRetry(
 		first.stderr,
 	);
 	await new Promise((resolveRetry) => setTimeout(resolveRetry, 10_000));
-	return await run(targetName, leaseId, command, { ...options, sync: false });
+	return await run(targetName, leaseId, command, { ...captured, sync: false });
 }
 
 const ARTIFACT_CHUNK_BYTES = 32 * 1024;

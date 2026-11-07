@@ -1,10 +1,101 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
-import ts from "typescript";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { fingerprintApiKey, saveModelListCache } from "../src/model-list-cache.js";
-import type { ModelListItem } from "@cursor/sdk";
+import { dirname, join, relative, resolve, toNamespacedPath } from "node:path";
+import ts from "@typescript/typescript6";
+import { afterEach, describe, expect, it } from "vitest";
+import { resolveInstalledPackageRoot } from "./helpers/installed-package.js";
+
+// Public Node APIs only: no SDK substitution, bundle IDs, or private factory execution.
+const firstSendProbe = `
+import { registerHooks, syncBuiltinESMExports } from "node:module";
+import net from "node:net";
+import tls from "node:tls";
+import http from "node:http";
+import https from "node:https";
+import http2 from "node:http2";
+import dns from "node:dns";
+import dgram from "node:dgram";
+import childProcess from "node:child_process";
+import workers from "node:worker_threads";
+import { fileURLToPath } from "node:url";
+import { relative, isAbsolute, sep } from "node:path";
+const [sdkUrl, sdkRoot, denyLazyImport] = process.argv.slice(1);
+const evidence = { created: false, sent: false, disposed: false, blocked: [], denied: false };
+const networkError = "SDK_CONTRACT_NETWORK_BLOCKED";
+const block = (api) => (...args) => {
+	evidence.blocked.push({ api, afterCreate: evidence.created, url: api === "fetch" ? String(args[0]) : undefined });
+	throw new Error(networkError);
+};
+// Guard before SDK evaluation, including named builtin imports and socket fallbacks.
+net.Socket.prototype.connect = block("socket");
+net.connect = net.createConnection = block("net");
+tls.connect = block("tls");
+http.request = http.get = block("http");
+https.request = https.get = block("https");
+http2.connect = block("http2");
+globalThis.fetch = block("fetch");
+dgram.createSocket = block("dgram");
+dgram.Socket.prototype.send = dgram.Socket.prototype.connect = block("dgram");
+for (const target of [dns, dns.promises, dns.Resolver.prototype, dns.promises.Resolver.prototype]) {
+	for (const name of Object.getOwnPropertyNames(target)) {
+		if (name === "lookup" || name === "lookupService" || name.startsWith("resolve") || name === "reverse") {
+			target[name] = block("dns");
+		}
+	}
+}
+// No subprocess, worker, or native-addon escape to an unguarded network stack.
+const denyEscape = () => { throw new Error("SDK_CONTRACT_PROCESS_BLOCKED"); };
+for (const name of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"]) {
+	childProcess[name] = denyEscape;
+}
+workers.Worker = denyEscape;
+process.dlopen = denyEscape;
+syncBuiltinESMExports();
+let agent, run, hook;
+const watchdog = setTimeout(() => process.exit(124), 10_000);
+try {
+	const { Agent, JsonlLocalAgentStore } = await import(sdkUrl);
+	agent = await Agent.create({
+		model: { id: "offline-contract" }, tools: [],
+		local: { cwd: process.cwd(), settingSources: [], enableAgentRetries: false,
+			store: new JsonlLocalAgentStore(process.cwd() + "/store") },
+	});
+	evidence.created = true;
+	if (denyLazyImport === "true") {
+		hook = registerHooks({ resolve(specifier, context, nextResolve) {
+			const result = nextResolve(specifier, context);
+			if (result.url.startsWith("file:")) {
+				const path = relative(sdkRoot, fileURLToPath(result.url));
+				if (path && path !== ".." && !path.startsWith(".." + sep) && !isAbsolute(path)) {
+					evidence.denied = true;
+					throw Object.assign(new Error("SDK_CONTRACT_LAZY_MODULE_MISSING"), { code: "ERR_MODULE_NOT_FOUND" });
+				}
+			}
+			return result;
+		} });
+	}
+	run = await agent.send("Credential-free first-send import contract");
+	evidence.sent = true;
+	evidence.outcome = await run.wait();
+} catch (error) {
+	evidence.failure = { name: error.name, message: error.message };
+} finally {
+	hook?.deregister();
+	try {
+		if (run?.status === "running") await run.cancel();
+		if (agent) {
+			await agent[Symbol.asyncDispose]();
+			evidence.disposed = true;
+		}
+	} catch (error) {
+		evidence.cleanupError = error.message;
+		process.exitCode = 1;
+	}
+	clearTimeout(watchdog);
+	console.log("SDK_FIRST_SEND_CONTRACT=" + JSON.stringify(evidence));
+}
+`;
 
 function sourceFiles(dir: string): string[] {
 	return readdirSync(dir).flatMap((entry) => {
@@ -20,6 +111,17 @@ function scriptKind(path: string): ts.ScriptKind {
 	return ts.ScriptKind.JS;
 }
 
+// Both architecture scans read the same immutable sources and one-write fixtures.
+const parsedSources = new Map<string, ts.SourceFile>();
+function sourceFile(path: string): ts.SourceFile {
+	let source = parsedSources.get(path);
+	if (!source) {
+		source = ts.createSourceFile(path, readFileSync(path, "utf-8"), ts.ScriptTarget.Latest, true, scriptKind(path));
+		parsedSources.set(path, source);
+	}
+	return source;
+}
+
 function moduleText(node: ts.ImportDeclaration | ts.ExportDeclaration): string | undefined {
 	return node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier) ? node.moduleSpecifier.text : undefined;
 }
@@ -32,7 +134,7 @@ function isTypeOnlyExport(node: ts.ExportDeclaration, isJavaScript: boolean): bo
 		: node.exportClause.elements.every((element) => element.isTypeOnly);
 }
 
-const PI_HOST_PEER_PREFIXES = ["@earendil-works/pi-", "@mariozechner/pi-"] as const;
+const PI_HOST_PEER_PREFIXES = ["@earendil-works/pi-"] as const;
 const PI_HOST_PEER_ROOTS = ["@sinclair/typebox", "typebox"] as const;
 
 function isPiHostPeer(specifier: string): boolean {
@@ -56,10 +158,30 @@ function isCursorSdkSpecifier(specifier: string): boolean {
 	return specifier === "@cursor/sdk" || specifier.startsWith("@cursor/sdk/");
 }
 
+function isAllowedCursorSdkStaticImport(relativePath: string, specifier: string): boolean {
+	// Compiled Bun Pi omits bare deps reached only via runtime dynamic import (#228).
+	return relativePath.endsWith("src/cursor-sdk-runtime.ts") && specifier === "@cursor/sdk";
+}
+
+function isAllowedBridgeRunStaticImport(relativePath: string): boolean {
+	return relativePath.endsWith("src/cursor-pi-tool-bridge-server.ts");
+}
+
 function isAllowedCursorSdkDynamicImport(relativePath: string, specifier: string): boolean {
+	return relativePath.endsWith("src/cursor-session-store.ts") && specifier === "@cursor/sdk/sqlite";
+}
+
+function isMcpRuntimeSpecifier(specifier: string): boolean {
+	return specifier.startsWith("@modelcontextprotocol/") || specifier === "@hono/node-server";
+}
+
+function isAllowedMcpRuntimeImport(relativePath: string, specifier: string): boolean {
 	return (
-		(relativePath.endsWith("src/cursor-sdk-runtime.ts") && specifier === "@cursor/sdk")
-		|| (relativePath.endsWith("src/cursor-session-store.ts") && specifier === "@cursor/sdk/sqlite")
+		relativePath.endsWith("src/cursor-pi-tool-bridge-run.ts")
+		&& specifier === "@modelcontextprotocol/server"
+	) || (
+		relativePath.endsWith("src/cursor-pi-tool-bridge-server.ts")
+		&& (specifier === "@modelcontextprotocol/hono" || specifier === "@hono/node-server")
 	);
 }
 
@@ -67,17 +189,17 @@ function collectRuntimeSdkEdges(paths: string[] = sourceFiles(join(process.cwd()
 	const offenders: string[] = [];
 	for (const path of paths) {
 		const relativePath = relative(process.cwd(), path).replace(/\\/g, "/");
-		const source = ts.createSourceFile(path, readFileSync(path, "utf-8"), ts.ScriptTarget.Latest, true, scriptKind(path));
+		const source = sourceFile(path);
 		const visit = (node: ts.Node): void => {
 			if (ts.isImportDeclaration(node) && importHasRuntimeBindings(node, false)) {
 				const specifier = moduleText(node);
-				if (specifier && isCursorSdkSpecifier(specifier)) {
+				if (specifier && isCursorSdkSpecifier(specifier) && !isAllowedCursorSdkStaticImport(relativePath, specifier)) {
 					offenders.push(`${relativePath}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}: runtime import ${specifier}`);
 				}
-				if (specifier?.startsWith("@modelcontextprotocol/sdk/") && !relativePath.endsWith("src/cursor-pi-tool-bridge-run.ts")) {
+				if (specifier && isMcpRuntimeSpecifier(specifier) && !isAllowedMcpRuntimeImport(relativePath, specifier)) {
 					offenders.push(`${relativePath}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}: runtime import ${specifier}`);
 				}
-				if (specifier === "./cursor-pi-tool-bridge-run.js") {
+				if (specifier === "./cursor-pi-tool-bridge-run.js" && !isAllowedBridgeRunStaticImport(relativePath)) {
 					offenders.push(`${relativePath}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}: runtime import bridge run implementation`);
 				}
 			}
@@ -86,7 +208,7 @@ function collectRuntimeSdkEdges(paths: string[] = sourceFiles(join(process.cwd()
 				if (specifier && isCursorSdkSpecifier(specifier)) {
 					offenders.push(`${relativePath}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}: runtime export ${specifier}`);
 				}
-				if (specifier?.startsWith("@modelcontextprotocol/sdk/")) {
+				if (specifier && isMcpRuntimeSpecifier(specifier)) {
 					offenders.push(`${relativePath}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}: runtime export ${specifier}`);
 				}
 			}
@@ -96,6 +218,9 @@ function collectRuntimeSdkEdges(paths: string[] = sourceFiles(join(process.cwd()
 					const specifier = argument.text;
 					if (isCursorSdkSpecifier(specifier) && !isAllowedCursorSdkDynamicImport(relativePath, specifier)) {
 						offenders.push(`${relativePath}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}: dynamic import ${specifier} outside runtime loader`);
+					}
+					if (isMcpRuntimeSpecifier(specifier) && !isAllowedMcpRuntimeImport(relativePath, specifier)) {
+						offenders.push(`${relativePath}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}: dynamic import ${specifier} outside bridge runtime`);
 					}
 				}
 			}
@@ -214,13 +339,7 @@ function collectUnsafeHostPeerLoads(
 	for (const path of paths) {
 		const isCanonicalNativeModule = resolve(path) === canonicalNativeModulePath;
 		const isJavaScriptSource = /\.[cm]?js$/.test(path);
-		const source = ts.createSourceFile(
-			path,
-			readFileSync(path, "utf-8"),
-			ts.ScriptTarget.Latest,
-			true,
-			scriptKind(path),
-		);
+		const source = sourceFile(path);
 		const nativeRequireNames = new Set<string>();
 		if (isCanonicalNativeModule) {
 			const collectNativeRequireNames = (node: ts.Node): void => {
@@ -397,19 +516,36 @@ function collectUnsafeHostPeerLoads(
 }
 
 describe("Cursor SDK lazy runtime imports", () => {
-	const originalEnv = process.env;
 	let tmpAgentDir: string | undefined;
 
 	afterEach(() => {
 		if (tmpAgentDir) rmSync(tmpAgentDir, { recursive: true, force: true });
 		tmpAgentDir = undefined;
-		process.env = originalEnv;
-		vi.doUnmock("@cursor/sdk");
-		vi.resetModules();
 	});
 
-	it("keeps heavy SDK value imports behind lazy runtime boundaries", () => {
+	it("limits heavy SDK value imports to Pi packaging entrypoints", () => {
 		expect(collectRuntimeSdkEdges()).toEqual([]);
+	});
+
+	it("requires static @cursor/sdk and bridge-run imports for compiled Bun Pi packaging (#228)", () => {
+		for (const [file, specifier] of [
+			["src/cursor-sdk-runtime.ts", "@cursor/sdk"],
+			["src/cursor-pi-tool-bridge-server.ts", "./cursor-pi-tool-bridge-run.js"],
+		] as const) {
+			const source = sourceFile(join(process.cwd(), file));
+			expect(source.statements.filter(ts.isImportDeclaration).some(node =>
+				moduleText(node) === specifier && importHasRuntimeBindings(node, false)), file).toBe(true);
+			const dynamicImports: string[] = [];
+			function visit(node: ts.Node): void {
+				if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+					const argument = node.arguments[0];
+					if (argument && ts.isStringLiteralLike(argument)) dynamicImports.push(argument.text);
+				}
+				ts.forEachChild(node, visit);
+			}
+			visit(source);
+			expect(dynamicImports, file).not.toContain(specifier);
+		}
 	});
 
 	it("rejects static SDK subpaths and template SDK imports outside the runtime loaders", () => {
@@ -441,13 +577,13 @@ describe("Cursor SDK lazy runtime imports", () => {
 		const srcDir = join(tmpAgentDir, "src");
 		mkdirSync(srcDir);
 		writeFileSync(join(srcDir, "entry.mts"), 'void import("./target.mjs");\n');
-		writeFileSync(join(srcDir, "target.mts"), 'import "@mariozechner/pi-mts";\n');
+		writeFileSync(join(srcDir, "target.mts"), 'import "@earendil-works/pi-mts";\n');
 		writeFileSync(join(srcDir, "edge.tsx"), 'void import("@earendil-works/pi-tsx");\n');
 		writeFileSync(join(srcDir, "edge.cts"), 'require("@earendil-works/pi-cts");\n');
 
 		const findings = collectUnsafeHostPeerLoads(sourceFiles(srcDir)).join("\n");
 		expect(findings).toContain("./target.mjs reaches");
-		expect(findings).toContain("@mariozechner/pi-mts");
+		expect(findings).toContain("@earendil-works/pi-mts");
 		expect(findings).toContain("native host-peer specifier @earendil-works/pi-tsx");
 		expect(findings).toContain("CommonJS .cts source is unsupported by the host-peer guard");
 	});
@@ -460,11 +596,11 @@ describe("Cursor SDK lazy runtime imports", () => {
 		mkdirSync(sharedDir);
 		writeFileSync(join(srcDir, "entry.ts"), 'import "../shared/edge.cjs";\n');
 		writeFileSync(join(sharedDir, "edge.js"), 'void import("@earendil-works/pi-shared-js");\n');
-		writeFileSync(join(sharedDir, "edge.cjs"), 'require("@mariozechner/pi-shared-cjs");\n');
+		writeFileSync(join(sharedDir, "edge.cjs"), 'require("@earendil-works/pi-shared-cjs");\n');
 
 		const findings = collectUnsafeHostPeerLoads(runtimeModuleFiles(srcDir, sharedDir)).join("\n");
 		expect(findings).toContain("native host-peer specifier @earendil-works/pi-shared-js");
-		expect(findings).toContain("native host-peer specifier @mariozechner/pi-shared-cjs");
+		expect(findings).toContain("native host-peer specifier @earendil-works/pi-shared-cjs");
 		expect(findings).toContain("CommonJS .cjs shared runtime is unsupported by the host-peer guard");
 	});
 
@@ -472,13 +608,57 @@ describe("Cursor SDK lazy runtime imports", () => {
 		expect(collectUnsafeHostPeerLoads()).toEqual([]);
 	});
 
+	it.each([false, true])("exercises real installed SDK first-send linking offline (deny lazy module: %s)", (denyLazyImport) => {
+		tmpAgentDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-cursor-sdk-first-send-")));
+		const sdkRoot = resolveInstalledPackageRoot("@cursor/sdk");
+		const env: NodeJS.ProcessEnv = {
+			HOME: tmpAgentDir, USERPROFILE: tmpAgentDir,
+			APPDATA: tmpAgentDir, LOCALAPPDATA: tmpAgentDir,
+			XDG_CONFIG_HOME: tmpAgentDir, XDG_DATA_HOME: tmpAgentDir, XDG_CACHE_HOME: tmpAgentDir,
+			TMPDIR: tmpAgentDir, TMP: tmpAgentDir, TEMP: tmpAgentDir, PATH: "",
+		};
+		// Windows needs its OS directory, not the caller's credentials, PATH, or NODE_OPTIONS.
+		if (process.platform === "win32") env.SystemRoot = process.env.SystemRoot;
+		const child = spawnSync(process.execPath, [
+			"--input-type=module", "--eval", firstSendProbe,
+			import.meta.resolve("@cursor/sdk"), sdkRoot, String(denyLazyImport),
+		], {
+			cwd: tmpAgentDir, env, encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL",
+			maxBuffer: 256 * 1024,
+		});
+		expect(child.error, child.stderr).toBeUndefined();
+		expect(child.status, child.stderr).toBe(0);
+		const receipt = child.stdout.split(/\r?\n/).find((line) => line.startsWith("SDK_FIRST_SEND_CONTRACT="));
+		expect(receipt, child.stdout).toBeDefined();
+		const evidence = JSON.parse(receipt!.slice("SDK_FIRST_SEND_CONTRACT=".length));
+		expect(evidence).toMatchObject({ created: true, disposed: true, denied: denyLazyImport });
+		expect(evidence.cleanupError).toBeUndefined();
+		if (denyLazyImport) {
+			// A request-time graph failure cannot pass by reaching an unrelated blocked catalog call.
+			expect(evidence.sent).toBe(false);
+			expect(evidence.blocked).toEqual([]);
+			expect(evidence.failure.message).toContain("SDK_CONTRACT_LAZY_MODULE_MISSING");
+		} else {
+			expect(evidence.failure).toBeUndefined();
+			expect(evidence.sent).toBe(true);
+			expect(evidence.outcome).toMatchObject({
+				status: "error",
+				error: { message: expect.stringContaining("SDK_CONTRACT_NETWORK_BLOCKED") },
+			});
+			// The installed SDK reaches this exchange before authenticated inference.
+			expect(evidence.blocked).toEqual([{
+				api: "fetch", afterCreate: true, url: "https://api2.cursor.sh/auth/exchange_user_api_key",
+			}]);
+		}
+	}, 20_000);
+
 	it("allows type-only import-equals for both Node module spellings", () => {
 		tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-sdk-type-import-equals-"));
 		const fixturePath = join(tmpAgentDir, "type-import-equals.ts");
 		writeFileSync(fixturePath, [
 			'import type NodeModule = require("node:module");',
 			'import type LegacyModule = require("module");',
-			'import type LegacyPi = require("@mariozechner/pi-ai");',
+			'import type LegacyPi = require("@earendil-works/pi-ai");',
 			'type LoaderLiteral = "module";',
 			'type PeerLiteral = "@earendil-works/pi-ai";',
 		].join("\n"));
@@ -486,7 +666,24 @@ describe("Cursor SDK lazy runtime imports", () => {
 		expect(collectUnsafeHostPeerLoads([fixturePath])).toEqual([]);
 	});
 
-	it("rejects direct require use in the canonical resolve-only loader", () => {
+	it.each([
+		{
+			label: "direct require calls",
+			uses: [
+				'class NamedLoader extends require("../shared/helper.mjs").default {}',
+				'class DirectLoader extends createRequire(import.meta.url)("../shared/helper.mjs").default {}',
+			],
+			messages: [
+				"require created by createRequire may only be used via require.resolve",
+				"createRequire may only initialize a named resolve-only loader",
+			],
+		},
+		{
+			label: "aliases",
+			uses: ['const alias = require;', 'alias("../shared/helper.mjs");'],
+			messages: ["require created by createRequire may only be used via require.resolve"],
+		},
+	])("rejects $label in the canonical resolve-only loader", ({ uses, messages }) => {
 		tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-sdk-native-require-"));
 		const srcDir = join(tmpAgentDir, "src");
 		const sharedDir = join(tmpAgentDir, "shared");
@@ -496,28 +693,12 @@ describe("Cursor SDK lazy runtime imports", () => {
 		writeFileSync(entryPath, [
 			'import { createRequire } from "node:module";',
 			'const require = createRequire(import.meta.url);',
-			'class NamedLoader extends require("../shared/helper.mjs").default {}',
-			'class DirectLoader extends createRequire(import.meta.url)("../shared/helper.mjs").default {}',
+			...uses,
 		].join("\n"));
 		writeFileSync(join(sharedDir, "helper.mjs"), 'import {} from "@earendil-works/pi-tui";\nexport default class Helper {}\n');
 
 		const findings = collectUnsafeHostPeerLoads(runtimeModuleFiles(srcDir, sharedDir), entryPath).join("\n");
-		expect(findings).toContain("require created by createRequire may only be used via require.resolve");
-		expect(findings).toContain("createRequire may only initialize a named resolve-only loader");
-	});
-
-	it("rejects aliases of the canonical native loader", () => {
-		tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-sdk-native-require-alias-"));
-		const entryPath = join(tmpAgentDir, "cursor-ripgrep-path.ts");
-		writeFileSync(entryPath, [
-			'import { createRequire } from "node:module";',
-			'const require = createRequire(import.meta.url);',
-			'const alias = require;',
-			'alias("../shared/helper.mjs");',
-		].join("\n"));
-
-		const findings = collectUnsafeHostPeerLoads([entryPath], entryPath).join("\n");
-		expect(findings).toContain("require created by createRequire may only be used via require.resolve");
+		for (const message of messages) expect(findings).toContain(message);
 	});
 
 	it("allows canonical loader names in erased type queries", () => {
@@ -587,10 +768,10 @@ describe("Cursor SDK lazy runtime imports", () => {
 			'import ImportEqualsHelper = require("../shared/import-equals-helper.mjs");',
 			'const runtimeRequire = Module.createRequire(import.meta.url);',
 			'runtimeRequire.resolve("@earendil-works/pi-default-create-require");',
-			'const indirectPeer = "@mariozechner/pi-indirect-require";',
+			'const indirectPeer = "@earendil-works/pi-indirect-require";',
 			'runtimeRequire(indirectPeer);',
 			'void import("@earendil-works/pi-ai/compat");',
-			'void import("@mariozechner/pi-tui/components");',
+			'void import("@earendil-works/pi-tui/components");',
 			'void import("@earendil-works/pi-future/runtime");',
 			'void import("typebox");',
 			'void import("@sinclair/typebox/value");',
@@ -608,19 +789,19 @@ describe("Cursor SDK lazy runtime imports", () => {
 		writeFileSync(join(nestedSharedDir, "host.mjs"), 'import { Text } from "@earendil-works/pi-tui/components";\nexport { Text };\n');
 		writeFileSync(join(sharedDir, "broken.mjs"), 'export { missing } from "./missing.mjs";\n');
 		writeFileSync(join(sharedDir, "empty-import.mjs"), 'import {} from "@earendil-works/pi-empty-import";\n');
-		writeFileSync(join(sharedDir, "empty-export.mjs"), 'export {} from "@mariozechner/pi-empty-export";\n');
-		writeFileSync(join(sharedDir, "import-equals-helper.mjs"), 'import {} from "@mariozechner/pi-import-equals-helper";\n');
+		writeFileSync(join(sharedDir, "empty-export.mjs"), 'export {} from "@earendil-works/pi-empty-export";\n');
+		writeFileSync(join(sharedDir, "import-equals-helper.mjs"), 'import {} from "@earendil-works/pi-import-equals-helper";\n');
 		writeFileSync(join(srcDir, "empty-import.ts"), 'import {} from "@earendil-works/pi-empty-ts-import";\n');
-		writeFileSync(join(srcDir, "empty-export.ts"), 'export {} from "@mariozechner/pi-empty-ts-export";\n');
+		writeFileSync(join(srcDir, "empty-export.ts"), 'export {} from "@earendil-works/pi-empty-ts-export";\n');
 
 		const findings = collectUnsafeHostPeerLoads(runtimeModuleFiles(srcDir, sharedDir)).join("\n");
 		expect(findings).toContain("native module loader node:module outside src/cursor-ripgrep-path.ts");
 		expect(findings).toContain("native module loader module outside src/cursor-ripgrep-path.ts");
 		expect(findings).toContain("runtime import-equals ../shared/import-equals-helper.mjs");
 		expect(findings).toContain("native host-peer specifier @earendil-works/pi-default-create-require");
-		expect(findings).toContain("native host-peer specifier @mariozechner/pi-indirect-require");
+		expect(findings).toContain("native host-peer specifier @earendil-works/pi-indirect-require");
 		expect(findings).toContain("native host-peer specifier @earendil-works/pi-ai/compat");
-		expect(findings).toContain("native host-peer specifier @mariozechner/pi-tui/components");
+		expect(findings).toContain("native host-peer specifier @earendil-works/pi-tui/components");
 		expect(findings).toContain("native host-peer specifier @earendil-works/pi-future/runtime");
 		expect(findings).toContain("native host-peer specifier typebox");
 		expect(findings).toContain("native host-peer specifier @sinclair/typebox/value");
@@ -631,40 +812,28 @@ describe("Cursor SDK lazy runtime imports", () => {
 		expect(findings).toContain("../shared/empty-import.mjs reaches");
 		expect(findings).toContain("@earendil-works/pi-empty-import");
 		expect(findings).toContain("../shared/empty-export.mjs reaches");
-		expect(findings).toContain("@mariozechner/pi-empty-export");
+		expect(findings).toContain("@earendil-works/pi-empty-export");
 		expect(findings).not.toContain("@earendil-works/pi-empty-ts-import");
-		expect(findings).not.toContain("@mariozechner/pi-empty-ts-export");
+		expect(findings).not.toContain("@earendil-works/pi-empty-ts-export");
 		expect(findings).toContain("non-literal dynamic import");
 		expect(findings).toContain("unresolved relative dynamic import ./missing.js");
 	});
 
-	it("serves a warm model catalog without evaluating @cursor/sdk", async () => {
-		tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-sdk-lazy-import-"));
-		process.env = { ...originalEnv, PI_CODING_AGENT_DIR: tmpAgentDir, CURSOR_API_KEY: "warm-cache-key" };
-		const model: ModelListItem = {
-			id: "composer-2",
-			displayName: "Composer 2",
-			variants: [{ params: [], displayName: "Composer 2", isDefault: true }],
-		};
-		expect(saveModelListCache(fingerprintApiKey("warm-cache-key"), [model])).toBe(true);
-		vi.doMock("@cursor/sdk", () => {
-			throw new Error("@cursor/sdk should not be evaluated on a warm cached discovery path");
-		});
-
-		const { discoverModels } = await import("../src/model-discovery.js");
-		const models = await discoverModels();
-
-		expect(models.map((entry) => entry.id)).toEqual(["composer-2"]);
-	});
-
-	it("loads the installed SDK checkpoint store without the old root sqlite dependency", async () => {
+	it("returns null for a missing agent checkpoint using installed SDK SQLite under an owned temporary root", async () => {
 		tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-sdk-checkpoint-contract-"));
+		const stateRoot = toNamespacedPath(join(tmpAgentDir, "state"));
 		const { loadCursorSdk } = await import("../src/cursor-sdk-runtime.js");
 		const { createAgentPlatform } = await loadCursorSdk();
+		const { SqliteLocalAgentStore } = await import("@cursor/sdk/sqlite");
+		const localStore = await SqliteLocalAgentStore.open({ workspaceRef: tmpAgentDir, stateRoot });
 
-		const platform = await createAgentPlatform({ workspaceRef: tmpAgentDir, scopedWorkspaceRef: tmpAgentDir });
-		const checkpoint = await platform.checkpointStore.loadLatest("pi-cursor-sdk-checkpoint-contract-test");
-
-		expect(checkpoint).toBeNull();
+		try {
+			const platform = await createAgentPlatform({ workspaceRef: tmpAgentDir, scopedWorkspaceRef: tmpAgentDir, localStore });
+			const checkpoint = await platform.checkpointStore.loadLatest("pi-cursor-sdk-checkpoint-contract-test");
+			expect(checkpoint).toBeNull();
+			expect(statSync(join(stateRoot, "index.db")).isFile()).toBe(true);
+		} finally {
+			await localStore.dispose();
+		}
 	});
 });

@@ -1,12 +1,15 @@
 import type { MockedFunction } from "vitest";
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, JsonValue, TextContent } from "@earendil-works/pi-ai";
 import type {
+	AgentStartEvent,
+	AgentEndEvent,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
 	ProviderConfig,
 	RegisteredCommand,
 	BeforeAgentStartEvent,
+	BeforeProviderHeadersEvent,
 	BeforeAgentStartEventResult,
 	SessionBeforeTreeEvent,
 	SessionBeforeCompactEvent,
@@ -25,7 +28,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 
-export type RegisteredTool = ToolDefinition<TSchema, unknown, unknown>;
+// Replay fixtures store tool results in Pi's JSON transcript, not arbitrary host objects.
+export type RegisteredTool = ToolDefinition<TSchema, JsonValue | undefined, unknown>;
 
 export type ExtensionContextOverrides = Omit<Partial<ExtensionContext>, "sessionManager" | "ui"> & {
 	sessionManager?: Partial<ExtensionContext["sessionManager"]>;
@@ -49,6 +53,9 @@ export type HarnessEventName =
 	| "session_info_changed"
 	| "model_select"
 	| "before_agent_start"
+	| "before_provider_headers"
+	| "agent_start"
+	| "agent_end"
 	| "turn_start"
 	| "turn_end"
 	| "session_shutdown"
@@ -72,6 +79,9 @@ export type HarnessEventMap = {
 	session_info_changed: SessionInfoChangedEvent;
 	model_select: HarnessModelSelectEvent;
 	before_agent_start: BeforeAgentStartEvent;
+	before_provider_headers: BeforeProviderHeadersEvent;
+	agent_start: AgentStartEvent;
+	agent_end: AgentEndEvent;
 	turn_start: TurnStartEvent;
 	turn_end: TurnEndEvent;
 	session_shutdown: SessionShutdownEvent;
@@ -214,7 +224,7 @@ export interface PiHarness extends EventHarness {
 		args?: string,
 		ctxOverrides?: ExtensionCommandContextOverrides,
 	) => Promise<void>;
-	_registered: Array<{ name: string; config: ProviderConfig }>;
+	_registered: Array<{ name: string; config: ProviderConfig; provider?: import("@earendil-works/pi-ai").Provider }>;
 	_commands: Map<string, RegisteredCommandOptions>;
 	_tools: RegisteredTool[];
 	_activeToolNames: () => string[];

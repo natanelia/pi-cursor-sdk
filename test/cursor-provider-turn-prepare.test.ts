@@ -1,3 +1,4 @@
+import { captureProviderTestOwnership } from "./helpers/cursor-provider-ownership.js";
 import { describe, expect, it, vi } from "vitest";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { resolveCursorSdkConfig, type CursorResolvedSdkConfig } from "../src/cursor-config.js";
@@ -7,6 +8,7 @@ import { makeAssistantMessage, makeContext, makeModel } from "./helpers/pi-harne
 function makeResolvedConfig(runtime: "local" | "cloud"): CursorResolvedSdkConfig {
 	return resolveCursorSdkConfig({
 		env: {},
+		user: { local: { storeRoot: runtime === "local" ? "/captured-root" : "/changed-root" } },
 		builtIn: { runtime, cloud: { contextHandoff: "bootstrap" } },
 	});
 }
@@ -32,6 +34,7 @@ vi.mock("../src/cursor-provider-live-run-drain.js", async (importOriginal) => {
 		drainExistingCursorLiveRunBeforeSend: vi.fn(async () => {
 			// Simulate the config changing underneath the turn while the drain await is in flight.
 			mockResolveCursorProviderTurnConfig.mockReturnValue(makeResolvedConfig("cloud"));
+			process.env.PI_CURSOR_NATIVE_TOOLS = "1";
 			return "continue_send";
 		}),
 	};
@@ -41,6 +44,7 @@ describe("CursorProviderTurnRunner config snapshotting (F3)", () => {
 	it("resolves the effective config exactly once per turn and threads the same snapshot into prepare, even if config changes during drain", async () => {
 		const { CursorProviderTurnRunner } = await import("../src/cursor-provider-turn-runner.js");
 
+		process.env.PI_CURSOR_NATIVE_TOOLS = "0";
 		const localSnapshot = makeResolvedConfig("local");
 		mockResolveCursorProviderTurnConfig.mockReturnValueOnce(localSnapshot);
 		const prepareMarker = new Error("stop after prepare capture");
@@ -49,6 +53,7 @@ describe("CursorProviderTurnRunner config snapshotting (F3)", () => {
 		});
 
 		const runner = new CursorProviderTurnRunner({
+			...captureProviderTestOwnership(makeModel(), makeContext()),
 			model: makeModel(),
 			context: makeContext(),
 			stream: createAssistantMessageEventStream(),
@@ -61,8 +66,11 @@ describe("CursorProviderTurnRunner config snapshotting (F3)", () => {
 
 		expect(mockResolveCursorProviderTurnConfig).toHaveBeenCalledTimes(1);
 		expect(mockPrepareCursorProviderTurn).toHaveBeenCalledTimes(1);
-		const preparedCallArgs = mockPrepareCursorProviderTurn.mock.calls[0]?.[0] as { resolvedConfig: CursorResolvedSdkConfig };
+		const preparedCallArgs = mockPrepareCursorProviderTurn.mock.calls[0]?.[0] as { resolvedConfig: CursorResolvedSdkConfig; nativeToolsEnabled: boolean };
+		expect(preparedCallArgs.nativeToolsEnabled).toBe(false);
+		delete process.env.PI_CURSOR_NATIVE_TOOLS;
 		expect(preparedCallArgs.resolvedConfig).toBe(localSnapshot);
 		expect(preparedCallArgs.resolvedConfig.runtime.value).toBe("local");
+		expect(preparedCallArgs.resolvedConfig.local.storeRoot.value).toBe("/captured-root");
 	});
 });

@@ -1,7 +1,7 @@
+import { assertCursorNativeToolsRuntime, resolveCursorNativeToolsEnabled } from "./cursor-native-tools.js";
+import { isCursorLeanEnabled } from "./cursor-lean.js";
 import { CursorLiveRunAbortError } from "./cursor-live-run-coordinator.js";
-import { drainExistingCursorLiveRunBeforeSend } from "./cursor-provider-live-run-drain.js";
-import { invalidateSessionAgent } from "./cursor-session-agent.js";
-import { getCursorSessionCwd, getCursorSessionScopeKey } from "./cursor-session-scope.js";
+import { cursorLiveRuns, drainExistingCursorLiveRunBeforeSend } from "./cursor-provider-live-run-drain.js";
 import { installCursorSdkProcessErrorGuard } from "./cursor-sdk-process-error-guard.js";
 import type { CursorRuntime } from "./cursor-config.js";
 import { CursorSdkEventDebugSink } from "./cursor-sdk-event-debug.js";
@@ -23,14 +23,15 @@ import type {
 	CursorProviderTurnSendResult,
 	LiveCursorProviderTurnRuntime,
 	LocalCursorProviderTurnPrepareResult,
+	StartedCursorProviderTurn,
 } from "./cursor-provider-turn-types.js";
 
 export type { CursorProviderTurnRunnerParams } from "./cursor-provider-turn-types.js";
 
-type LocalLivePreparedTurn = LocalCursorProviderTurnPrepareResult & { runtime: LiveCursorProviderTurnRuntime };
+type LocalLivePreparedTurn = StartedCursorProviderTurn & LocalCursorProviderTurnPrepareResult & { runtime: LiveCursorProviderTurnRuntime };
 
-function requireLocalLivePreparedTurn(prepared: CursorProviderTurnPrepareResult): LocalLivePreparedTurn {
-	if (prepared.runtimeTarget !== "local" || prepared.runtime.kind !== "live") {
+function requireLocalLivePreparedTurn(prepared: StartedCursorProviderTurn): LocalLivePreparedTurn {
+	if (prepared.runtimeTarget !== "local" || prepared.execution !== "conversation" || prepared.runtime.kind !== "live") {
 		throw new Error("Cursor live run requires a local live prepared turn");
 	}
 	return prepared as LocalLivePreparedTurn;
@@ -54,6 +55,7 @@ export class CursorProviderTurnRunner {
 	async run(sdkProcessErrorGuard: ReturnType<typeof installCursorSdkProcessErrorGuard>): Promise<void> {
 		const { stream, partial, model, context, options, sdkEventDebugRef } = this.params;
 		let prepared: CursorProviderTurnPrepareResult | undefined;
+		let started: StartedCursorProviderTurn | undefined;
 		let sendResult: CursorProviderTurnSendResult | undefined;
 		let liveCompletion: CursorLiveRunCompletion | undefined;
 		const runFinalizer = new CursorRunFinalizer({
@@ -66,29 +68,27 @@ export class CursorProviderTurnRunner {
 
 		try {
 			this.throwIfAborted();
-			const cwd = getCursorSessionCwd();
+			const { scope } = this.params;
+			const cwd = scope.cwd;
+
+			// Resolved once here, before any drain await, so the drain decision and the
+			// prepare dispatch below always act on the same config snapshot.
+			const resolvedConfig = resolveCursorProviderTurnConfig(cwd, scope.projectTrusted, scope.scopeKey);
+			this.runtimeTarget = resolvedConfig.runtime.value;
+			const leanEnabled = isCursorLeanEnabled();
+			const nativeToolsEnabled = resolveCursorNativeToolsEnabled(process.env, leanEnabled);
+			assertCursorNativeToolsRuntime(this.runtimeTarget, nativeToolsEnabled, leanEnabled);
 			this.sdkEventDebug = CursorSdkEventDebugSink.maybeCreate({
 				cwd,
 				modelId: model.id,
 				provider: model.provider,
+				scope,
 			});
 			sdkEventDebugRef.current = this.sdkEventDebug;
 			this.sdkEventDebug?.recordContextSnapshot(context);
-			// Resolved once here, before any drain await, so the drain decision and the
-			// prepare dispatch below always act on the same config snapshot.
-			const resolvedConfig = resolveCursorProviderTurnConfig(cwd);
-			this.runtimeTarget = resolvedConfig.runtime.value;
-			if (resolvedConfig.runtime.value === "local") {
-				// The observed local-executor closed-pipe EPIPE is contained only from this
-				// turn's pre-send live-run drain through run completion; for live runs the
-				// finalizer holds the guard until run.wait() settles. A hit marks
-				// this scope's pooled agent transport dead so the next acquire recreates it.
-				const localScopeKey = getCursorSessionScopeKey();
-				sdkProcessErrorGuard.containLocalTransportClosedPipe(() =>
-					invalidateSessionAgent(localScopeKey, { deadTransport: true }),
-				);
+			if (resolvedConfig.runtime.value === "local" && this.params.request.purpose === "normal") {
 				if (
-					(await drainExistingCursorLiveRunBeforeSend(stream, partial, model, context, options?.signal, this.sdkEventDebug)) ===
+					(await drainExistingCursorLiveRunBeforeSend(stream, partial, model, context, options?.signal, this.sdkEventDebug, scope.scopeKey, this.params.request.occupancyFloor, nativeToolsEnabled)) ===
 					"stream_ended"
 				) {
 					return;
@@ -104,11 +104,37 @@ export class CursorProviderTurnRunner {
 				sdkEventDebug: this.sdkEventDebug,
 				throwIfAborted: () => this.throwIfAborted(),
 				resolvedConfig,
+				leanEnabled,
+				nativeToolsEnabled,
 			});
+
+			const usage = await this.params.usageRecorder.start({
+				agent: prepared.agent,
+				runtime: prepared.runtimeTarget,
+				model: { id: model.id, provider: model.provider, cost: { ...model.cost } },
+				modelSelection: prepared.meta.modelSelection,
+				purpose: this.params.request.purpose,
+				...(prepared.runtimeTarget === "local" ? { storeIdentity: prepared.storeIdentity.stateRoot } : {}),
+				resumed: prepared.runtimeTarget === "local" && prepared.execution === "conversation" && prepared.sessionAgentLease.resumed === true,
+				newlyCreated: prepared.runtimeTarget !== "local" || prepared.execution === "summary" || (prepared.sessionAgentLease.created && !prepared.sessionAgentLease.resumed),
+			}).catch(error => {
+				this.params.usageRecorder.notePersistenceFailure(error);
+				throw error;
+			});
+			started = { ...prepared, usage };
+			if (started.runtime.liveRun) {
+				started.runtime.liveRun.onAbandon = async () => {
+					try {
+						await usage.recordTerminal({ status: "abandon" });
+					} catch (error) {
+						usage.notePersistenceFailure(error);
+					}
+				};
+			}
 
 			sendResult = await sendCursorProviderTurn({
 				params: this.params,
-				prepared,
+				prepared: started,
 				sdkEventDebug: this.sdkEventDebug,
 				sdkProcessErrorGuard,
 				throwIfAborted: () => this.throwIfAborted(),
@@ -117,7 +143,7 @@ export class CursorProviderTurnRunner {
 			const { send } = sendResult;
 
 			if (prepared.runtime.kind === "live") {
-				const livePrepared = requireLocalLivePreparedTurn(prepared);
+				const livePrepared = requireLocalLivePreparedTurn(started);
 				liveCompletion = runFinalizer.startLiveRunCompletion({
 					send,
 					prepared: livePrepared,
@@ -135,7 +161,7 @@ export class CursorProviderTurnRunner {
 
 			const outcomePromise = awaitFinalizeCursorRunOutcome({
 				run: send.run,
-				prepared,
+				prepared: started,
 				cursorAgentMessageOffset: send.cursorAgentMessageOffset,
 				modelId: model.id,
 				signal: options?.signal,
@@ -150,12 +176,18 @@ export class CursorProviderTurnRunner {
 			const finalized = await outcomePromise;
 			await runFinalizer.applyTerminalEvent({
 				kind: "direct",
-				prepared,
+				prepared: started,
 				outcome: finalized.outcome,
 				displayOnlyTraceBlock: finalized.displayOnlyTraceBlock,
 			});
 		} catch (error) {
-			await runFinalizer.applyTerminalEvent({ kind: "error", prepared, error });
+			// This body owns the session turn lease; a queued request aborted before
+			// entry must not release another request's run in handleOuterCatch().
+			if (!prepared && (error instanceof CursorLiveRunAbortError || options?.signal?.aborted)) {
+				const pending = cursorLiveRuns.getActiveForScope(this.params.scope.scopeKey);
+				if (pending && !pending.disposed) await cursorLiveRuns.release(pending);
+			}
+			await runFinalizer.applyTerminalEvent({ kind: "error", prepared: started ?? prepared, error });
 		} finally {
 			await runFinalizer.cleanup(prepared, sendResult, liveCompletion);
 		}

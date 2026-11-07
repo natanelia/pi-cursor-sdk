@@ -21,6 +21,8 @@ const execFile = promisify(execFileCallback);
 // ERR_PACKAGE_PATH_NOT_EXPORTED even when installed.
 const REQUIRED_SOURCE_BUILD_MODULES = [
 	"typescript",
+	"@types/node",
+	"esbuild",
 	"typebox",
 	"@earendil-works/pi-ai",
 	"@earendil-works/pi-coding-agent",

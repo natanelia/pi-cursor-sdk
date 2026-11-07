@@ -137,6 +137,12 @@ async function invokeSessionBeforeTreeHandlers(
 
 function createHarnessEventApi(): EventHarness {
 	const handlers = new Map<HarnessEventName, HarnessStoredHandler[]>();
+	let sessionManager = createExtensionTestContext().sessionManager;
+	const createContext = (overrides: ExtensionContextOverrides) => {
+		const ctx = createExtensionTestContext({ ...overrides, sessionManager: overrides.sessionManager ?? sessionManager });
+		sessionManager = ctx.sessionManager;
+		return ctx;
+	};
 
 	const on = vi.fn(((event: HarnessEventName, handler: HarnessStoredHandler) => {
 		const existing = handlers.get(event) ?? [];
@@ -198,7 +204,7 @@ function createHarnessEventApi(): EventHarness {
 		payload: HarnessEventMap[E],
 		ctxOverrides: ExtensionContextOverrides = {},
 	): Promise<HarnessEventInvokeResult<E>> => {
-		return invokeEventWithContext(event, payload, createExtensionTestContext(ctxOverrides));
+		return invokeEventWithContext(event, payload, createContext(ctxOverrides));
 	};
 
 	const runSessionStart = async (
@@ -226,17 +232,15 @@ function createHarnessEventApi(): EventHarness {
 	const runBeforeAgentStart = async (
 		ctxOverrides: ExtensionContextOverrides = {},
 	): Promise<HarnessEventInvokeResult<"before_agent_start">> => {
-		const ctx = createExtensionTestContext(ctxOverrides);
-		return invokeEventWithContext(
-			"before_agent_start",
-			{
-				type: "before_agent_start",
-				prompt: "start",
-				systemPrompt: "",
-				systemPromptOptions: createDefaultSystemPromptOptions(ctx.cwd),
-			} satisfies BeforeAgentStartEvent,
-			ctx,
-		);
+		const ctx = createContext(ctxOverrides);
+		const event = {
+			type: "before_agent_start",
+			messageType: "user",
+			prompt: "start",
+			systemPrompt: "",
+			systemPromptOptions: createDefaultSystemPromptOptions(ctx.cwd),
+		} satisfies BeforeAgentStartEvent & { messageType: "user" };
+		return invokeEventWithContext("before_agent_start", event, ctx);
 	};
 
 	const runTurnStart = async (ctxOverrides: ExtensionContextOverrides = {}): Promise<void> => {
@@ -254,6 +258,20 @@ function createHarnessEventApi(): EventHarness {
 				turnIndex: 1,
 				message: makeAssistantMessage("") as TurnEndEvent["message"],
 				toolResults: [],
+				...{
+					messageEntryId: "assistant-1",
+					toolResultEntryIds: [],
+					entries: [],
+					continue: false,
+					context: {
+						contextEntries: [],
+						contextMessages: [],
+						llmMessages: [],
+						pendingMessages: [],
+						canContinue: true,
+					},
+					outcome: "completed" as const,
+				},
 				...eventOverrides,
 			},
 			ctxOverrides,
@@ -336,7 +354,7 @@ function createHarnessEventApi(): EventHarness {
 		event: ToolCallEvent,
 		ctxOverrides: ExtensionContextOverrides = {},
 	): Promise<ToolCallEventResult | undefined> => {
-		return runToolCallWithContext(event, createExtensionTestContext(ctxOverrides));
+		return runToolCallWithContext(event, createContext(ctxOverrides));
 	};
 
 	const runToolResult = async (

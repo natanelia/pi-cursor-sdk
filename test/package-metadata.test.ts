@@ -1,11 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { OPENAI_CODEX_MODELS } from "@earendil-works/pi-ai/providers/openai-codex.models";
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
 import { FALLBACK_MODEL_ITEMS } from "../src/cursor-fallback-models.generated.js";
+import { resolveInstalledPackageRoot } from "./helpers/installed-package.js";
 
 const require = createRequire(import.meta.url);
 const packageJson = require("../package.json") as {
@@ -14,11 +17,11 @@ const packageJson = require("../package.json") as {
 	devDependencies: Record<string, string>;
 	peerDependencies: Record<string, string>;
 	bundledDependencies?: string[];
-	overrides?: Record<string, string>;
+	overrides?: Record<string, string | Record<string, string>>;
 };
 const packageLock = require("../package-lock.json") as {
 	version: string;
-	packages: Record<string, { version?: string; resolved?: string; dependencies?: Record<string, string>; bundleDependencies?: boolean | string[] }>;
+	packages: Record<string, { version?: string; resolved?: string; dev?: boolean; dependencies?: Record<string, string>; bundleDependencies?: boolean | string[] }>;
 };
 
 const PI_PACKAGES = [
@@ -27,7 +30,12 @@ const PI_PACKAGES = [
 	"@earendil-works/pi-tui",
 ] as const;
 
-const BUNDLED_MCP_HONO_CLOSURE = ["@hono/node-server", "@modelcontextprotocol/sdk"] as const;
+const BUNDLED_MCP_HONO_CLOSURE = [
+	"@hono/node-server",
+	"@modelcontextprotocol/hono",
+	"@modelcontextprotocol/server",
+	"hono",
+] as const;
 
 function lockPackageVersion(packageName: string): string | undefined {
 	return packageLock.packages[`node_modules/${packageName}`]?.version;
@@ -65,32 +73,102 @@ function npmPack(args: string[], cwd: string): string {
 
 describe("package metadata cutover baselines", () => {
 	it("keeps package, lockfile, and changelog release versions aligned", () => {
-		const changelogVersion = readFileSync(join(process.cwd(), "CHANGELOG.md"), "utf8").match(/^## (\S+) /m)?.[1];
+		const changelogVersion = readFileSync(join(process.cwd(), "CHANGELOG.md"), "utf8").match(/^## (\d+\.\d+\.\d+)(?:\s|$)/m)?.[1];
 
 		expect(packageLock.version).toBe(packageJson.version);
 		expect(packageLock.packages[""]?.version).toBe(packageJson.version);
 		expect(changelogVersion).toBe(packageJson.version);
 	});
 
-	it("pins Cursor SDK exactly", () => {
-		expect(packageJson.dependencies["@cursor/sdk"]).toBe("1.0.27");
-		expect(lockPackageVersion("@cursor/sdk")).toBe("1.0.27");
+	it("pairs all shared CI/release workflows and automation checkouts at one immutable revision", () => {
+		type Invocation = { uses?: string; with?: Record<string, string> };
+		const workflowDir = join(process.cwd(), ".github", "workflows");
+		const refs: Array<string | undefined> = [];
+		for (const file of readdirSync(workflowDir).filter((file) => /\.ya?ml$/.test(file))) {
+			const workflow = parse(readFileSync(join(workflowDir, file), "utf8")) as {
+				jobs: Record<string, Invocation & { steps?: Invocation[] }>;
+			};
+			for (const job of Object.values(workflow.jobs)) {
+				for (const invocation of [job, ...(job.steps ?? [])]) {
+					if (invocation.uses?.startsWith("fitchmultz/.github/")) {
+						refs.push(invocation.uses.split("@")[1]);
+						expect(invocation.with?.["automation-ref"], `${file}: shared workflow needs automation-ref`).toBeDefined();
+					}
+					if (invocation.with?.["automation-ref"] !== undefined) refs.push(invocation.with["automation-ref"]);
+					if (invocation.with?.repository === "fitchmultz/.github") refs.push(invocation.with.ref);
+				}
+			}
+		}
+		expect(refs.length).toBeGreaterThan(0);
+		for (const ref of refs) expect(ref).toMatch(/^[a-f0-9]{40}$/);
+		expect(new Set(refs).size, `Mixed shared automation revisions: ${[...new Set(refs)].join(", ")}`).toBe(1);
 	});
 
-	it("keeps lockfile resolved URLs on the public npm registry", () => {
-		const hosts = new Set(
-			Object.values(packageLock.packages)
-				.flatMap((entry) => (entry.resolved ? [new URL(entry.resolved).host] : [])),
-		);
-		expect([...hosts]).toEqual(["registry.npmjs.org"]);
-	});
-
-	it("ships an exact MCP/Hono bundledDependencies closure for published installs", () => {
-		expect(packageJson.dependencies["@modelcontextprotocol/sdk"]).toBe("1.30.0");
-		expect(lockPackageVersion("@modelcontextprotocol/sdk")).toBe("1.30.0");
-		expect(packageJson.dependencies["@hono/node-server"]).toBe("2.0.12");
-		expect(lockPackageVersion("@hono/node-server")).toBe("2.0.12");
+	it("pins SDK, MCP/Hono, Pi, and TypeBox validation dependencies", () => {
+		const version = packageJson.dependencies["@cursor/sdk"];
+		expect(version).toMatch(/^\d+\.\d+\.\d+$/);
+		expect(lockPackageVersion("@cursor/sdk")).toBe(version);
+		for (const packageName of BUNDLED_MCP_HONO_CLOSURE) {
+			expect(packageJson.dependencies[packageName]).toMatch(/^\d+\.\d+\.\d+$/);
+			expect(lockPackageVersion(packageName)).toBe(packageJson.dependencies[packageName]);
+		}
+		expect(packageJson.dependencies["@modelcontextprotocol/sdk"]).toBeUndefined();
 		expect(packageJson.bundledDependencies).toEqual([...BUNDLED_MCP_HONO_CLOSURE]);
+		const baseline = packageJson.devDependencies["@earendil-works/pi-coding-agent"];
+		expect(baseline).toMatch(/^\d+\.\d+\.\d+$/);
+		for (const packageName of PI_PACKAGES) {
+			expect(packageJson.devDependencies[packageName]).toBe(baseline);
+			expect(lockPackageVersion(packageName)).toBe(baseline);
+		}
+		expect(packageJson.devDependencies.typebox).toMatch(/^\d+\.\d+\.\d+$/);
+		expect(lockPackageVersion("typebox")).toBe(packageJson.devDependencies.typebox);
+	});
+
+	it("supplies the SDK's required Zod peer without peer auto-installation", () => {
+		const sdkRoot = resolveInstalledPackageRoot("@cursor/sdk");
+		const sdk = JSON.parse(readFileSync(join(sdkRoot, "package.json"), "utf8")) as {
+			peerDependencies?: Record<string, string>;
+			peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+		};
+		expect(sdk.peerDependencies?.zod).toBe("^3.25.0 || ^4.0.0");
+		expect(sdk.peerDependenciesMeta?.zod?.optional).not.toBe(true);
+		// The patched SDK peer must stay external to the bridge's newer bundle.
+		expect(packageJson.dependencies.zod).toBe("4.6.6");
+		expect(packageLock.packages[""]?.dependencies?.zod).toBe(packageJson.dependencies.zod);
+		expect(lockPackageVersion("zod")).toBe(packageJson.dependencies.zod);
+		const sdkRequire = createRequire(join(sdkRoot, "package.json"));
+		for (const specifier of ["zod", "zod/v3", "zod/v4", "zod/v4-mini"]) {
+			expect(sdkRequire.resolve(specifier)).toBe(require.resolve(specifier));
+		}
+	});
+
+	it.each([
+		["@cursor/sdk", "zod/v4"],
+		["@cursor/sdk", "zod/v4-mini"],
+		["@modelcontextprotocol/server", "zod/v4"],
+		["@modelcontextprotocol/core", "zod/v4"],
+	])("%s's %s rejects oversized bounded arrays before parsing elements", async (packageName, specifier) => {
+		const packageRoot = resolveInstalledPackageRoot(packageName);
+		const zodEntry = createRequire(join(packageRoot, "package.json")).resolve(specifier);
+		// Both entrypoints expose this functional API.
+		const z = (await import(pathToFileURL(zodEntry).href)) as typeof import("zod/v4-mini");
+		const unbounded = z.array(z.number());
+		const bounded = z.array(z.number()).check(z.maxLength(2));
+		expect(bounded.safeParse([1, "a", "b", "c"]).error?.issues.map((issue) => issue.code)).toEqual(["too_big"]);
+		expect(bounded.safeParse([1, 2]).success).toBe(true);
+		expect(bounded.safeParse([1, "a"]).error?.issues.map((issue) => issue.code)).toEqual(["invalid_type"]);
+		expect(unbounded.safeParse([1, "a", "b", "c"]).error?.issues.map((issue) => issue.code)).toEqual([
+			"invalid_type", "invalid_type", "invalid_type",
+		]);
+	});
+
+	it("keeps registry dependencies public", () => {
+		for (const entry of Object.values(packageLock.packages)) {
+			if (!entry.resolved) continue;
+			const url = new URL(entry.resolved);
+			expect(url.protocol).toBe("https:");
+			expect(url.host).toBe("registry.npmjs.org");
+		}
 	});
 
 	it("keeps local agent ID policy aligned with the installed public string contract", () => {
@@ -99,35 +177,10 @@ describe("package metadata cutover baselines", () => {
 		expect(sdkOptions).toMatch(/export interface AgentOptions[\s\S]*?\bagentId\?: string;/);
 	});
 
-	it("pins the Node ConnectRPC transport required by Cursor SDK's Node seam", () => {
-		const sdkTransportDts = readFileSync(
-			join(process.cwd(), "node_modules/@cursor/sdk/dist/esm/transport.d.ts"),
-			"utf8",
-		);
-
-		expect(sdkTransportDts).toContain("Node");
-		expect(sdkTransportDts).toContain("`@connectrpc/connect-node`");
-		expect(packageLock.packages["node_modules/@cursor/sdk"]?.dependencies?.["@connectrpc/connect-node"]).toBe("^1.6.1");
+	it("keeps the SDK-vendored Node transport out of the external dependency tree", () => {
+		expect(packageLock.packages["node_modules/@cursor/sdk"]?.dependencies?.["@connectrpc/connect-node"]).toBeUndefined();
 		expect(packageJson.dependencies["@connectrpc/connect-node"]).toBeUndefined();
-		expect(lockPackageVersion("@connectrpc/connect-node")).toBe("1.7.0");
-	});
-
-	it("keeps installed ConnectRPC transport siblings aligned", () => {
-		expect(lockPackageVersion("@connectrpc/connect-node")).toBe("1.7.0");
-		expect(lockPackageVersion("@connectrpc/connect-web")).toBe("1.7.0");
-	});
-
-	it("leaves the Cursor SDK transport dependency tree to npm resolution", () => {
-		expect(packageJson.dependencies.undici).toBeUndefined();
-		expect(packageJson.bundledDependencies).toEqual([...BUNDLED_MCP_HONO_CLOSURE]);
-		expect(packageJson.bundledDependencies).not.toContain("undici");
-		expect(packageJson.bundledDependencies).not.toContain("@cursor/sdk");
-		expect(packageJson.overrides).toBeUndefined();
-		expect(packageLock.packages["node_modules/@connectrpc/connect-node/node_modules/undici"]?.version).toBe("5.29.0");
-	});
-
-	it("removes the obsolete sqlite override", () => {
-		expect(packageJson.overrides).toBeUndefined();
+		expect(lockPackageVersion("@connectrpc/connect-node")).toBeUndefined();
 	});
 
 	it("packs an isolated MCP/Hono closure that beats a hostile host @hono/node-server", () => {
@@ -140,29 +193,88 @@ describe("package metadata cutover baselines", () => {
 			const listing = execFileSync("tar", ["-tzf", tarballName!], { cwd: tempRoot, encoding: "utf8" });
 			expect(listing).toContain("package/package.json");
 			const packedIdentities = packageIdentitiesFromTarListing(listing);
-			expect(packedIdentities.has("@modelcontextprotocol/sdk")).toBe(true);
-			expect(packedIdentities.has("@hono/node-server")).toBe(true);
+			for (const packageName of BUNDLED_MCP_HONO_CLOSURE) {
+				expect(packedIdentities.has(packageName)).toBe(true);
+			}
+			expect(packedIdentities.has("@modelcontextprotocol/sdk")).toBe(false);
+			expect(packedIdentities.has("@modelcontextprotocol/client")).toBe(false);
 			expect(packedIdentities.has("@cursor/sdk")).toBe(false);
 			expect(packedIdentities.has("undici")).toBe(false);
-
-			const extractDirName = "extract";
-			const extractDir = join(tempRoot, extractDirName);
-			mkdirSync(extractDir);
-			execFileSync("tar", ["-xzf", tarballName!, "-C", extractDirName], { cwd: tempRoot });
-
-			const packedPackageJson = JSON.parse(readFileSync(join(extractDir, "package", "package.json"), "utf8")) as {
-				bundledDependencies?: string[];
-				dependencies?: Record<string, string>;
-			};
-			expect(packedPackageJson.bundledDependencies).toEqual([...BUNDLED_MCP_HONO_CLOSURE]);
-			expect(packedPackageJson.dependencies?.["@modelcontextprotocol/sdk"]).toBe("1.30.0");
-			expect(packedPackageJson.dependencies?.["@hono/node-server"]).toBe("2.0.12");
+			// Pi's managed npm installs omit peers, so the hoisted SDK can only use a non-bundled Zod.
+			expect(listing).not.toContain("package/node_modules/zod/package.json");
 
 			const hostRoot = join(tempRoot, "host");
 			const hostNodeModules = join(hostRoot, "node_modules");
 			const packageDir = join(hostNodeModules, "pi-cursor-sdk");
-			mkdirSync(packageDir, { recursive: true });
-			cpSync(join(extractDir, "package"), packageDir, { recursive: true });
+			mkdirSync(hostNodeModules, { recursive: true });
+			execFileSync("tar", ["-xzf", tarballName!, "-C", "host/node_modules"], { cwd: tempRoot });
+			renameSync(join(hostNodeModules, "package"), packageDir);
+			const paths = new Set(listing.trim().split(/\r?\n/).map((path) => path.replace(/^package\//, "")));
+			expect(paths.has("scripts/tmux-live-smoke.sh")).toBe(true);
+			expect(paths.has("scripts/isolated-cursor-smoke.sh")).toBe(true);
+			expect(paths.has("scripts/fixtures/plan-strip-shim/index.ts")).toBe(true);
+			expect(paths.has("scripts/steering-rpc-smoke.mjs")).toBe(true);
+			expect(paths.has("scripts/visual-tui-smoke.mjs")).toBe(true);
+			expect(paths.has("scripts/validate-smoke-jsonl.mjs")).toBe(true);
+			expect(paths.has("scripts/debug-sdk-events.mjs")).toBe(true);
+			expect(paths.has("scripts/debug-provider-events.mjs")).toBe(true);
+			expect(paths.has("platform-smoke.config.mjs")).toBe(true);
+			expect(paths.has("scripts/platform-smoke/artifact-bundle-chunk.mjs")).toBe(true);
+			expect(paths.has("scripts/platform-smoke/live-suite-runner.mjs")).toBe(true);
+			expect(paths.has("scripts/platform-smoke/local-resume-runner.mjs")).toBe(true);
+			expect(paths.has("scripts/platform-smoke/target-runtime.mjs")).toBe(true);
+			expect(paths.has("scripts/platform-smoke/visual-evidence.mjs")).toBe(true);
+			for (const path of paths) {
+				if (!path.endsWith(".mjs")) continue;
+				const declarationPath = path.replace(/\.mjs$/, ".d.mts");
+				if (existsSync(declarationPath)) expect(paths.has(declarationPath)).toBe(true);
+			}
+			expect(paths.has("shared/cursor-setting-sources.mjs")).toBe(true);
+			expect(paths.has("shared/cursor-setting-sources.d.mts")).toBe(true);
+			expect(paths.has("shared/cursor-sensitive-text.mjs")).toBe(true);
+			expect(paths.has("shared/cursor-sensitive-text.d.mts")).toBe(true);
+			expect(paths.has("scripts/lib/local-resume-smoke-harness.mjs")).toBe(true);
+			expect(paths.has("scripts/lib/cloud-smoke-cleanup-evidence.mjs")).toBe(true);
+			expect(paths.has("scripts/lib/cloud-smoke-cleanup-evidence.d.mts")).toBe(true);
+			expect(paths.has("scripts/lib/cloud-smoke-github.mjs")).toBe(true);
+			expect(paths.has("scripts/lib/cloud-smoke-github.d.mts")).toBe(true);
+			expect(paths.has("scripts/lib/cursor-smoke-env.mjs")).toBe(true);
+			expect(paths.has("scripts/lib/cursor-smoke-env.d.mts")).toBe(true);
+			expect(paths.has("scripts/lib/cursor-smoke-shell.sh")).toBe(true);
+			expect(paths.has("scripts/lib/cursor-visual-render.mjs")).toBe(true);
+			expect(paths.has("scripts/lib/cursor-visual-render.d.mts")).toBe(true);
+			expect(paths.has("shared/cursor-sdk-event-debug-env.mjs")).toBe(true);
+			expect(paths.has("shared/cursor-sdk-event-debug-env.d.mts")).toBe(true);
+			expect(paths.has("scripts/lib/cursor-setting-sources.mjs")).toBe(false);
+			expect(paths.has("scripts/lib/cursor-sensitive-text.mjs")).toBe(false);
+			expect(paths.has("scripts/lib/cursor-cli-args.mjs")).toBe(true);
+			expect(paths.has("CHANGELOG.md")).toBe(true);
+			expect(paths.has("README.md")).toBe(true);
+			expect(paths.has("docs/platform-smoke.md")).toBe(true);
+			expect(paths.has("dist/index.js")).toBe(true);
+			// pi silently drops manifest entries whose file is missing; assert the
+			// manifest target exists inside the actual published tarball.
+			const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")) as { pi?: { extensions?: string[] } };
+			for (const entry of manifest.pi?.extensions ?? []) {
+				expect(paths.has(entry.replace(/^\.\//, "")), `pi.extensions entry missing from package: ${entry}`).toBe(true);
+			}
+			expect(paths.has("tsconfig.build.json")).toBe(true);
+			expect(paths.has("scripts/build.mjs")).toBe(true);
+			expect(paths.has("scripts/prepare.mjs")).toBe(true);
+			// Launchers import this helper; packed installs break without it.
+			expect(paths.has("scripts/lib/ensure-built.mjs")).toBe(true);
+			expect([...paths].some((path) => path.startsWith("coverage/") || path.startsWith(".pi/") || path.includes("smoke-dir"))).toBe(false);
+
+			const packedPackageJson = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")) as {
+				name: string;
+				bundledDependencies?: string[];
+				dependencies?: Record<string, string>;
+			};
+			expect(packedPackageJson.name).toBe("pi-cursor-sdk");
+			expect(packedPackageJson.bundledDependencies).toEqual([...BUNDLED_MCP_HONO_CLOSURE]);
+			for (const packageName of BUNDLED_MCP_HONO_CLOSURE) {
+				expect(packedPackageJson.dependencies?.[packageName]).toBe(packageJson.dependencies[packageName]);
+			}
 
 			const hostileDir = join(hostNodeModules, "@hono", "node-server");
 			mkdirSync(hostileDir, { recursive: true });
@@ -172,11 +284,8 @@ describe("package metadata cutover baselines", () => {
 			);
 			writeFileSync(join(hostileDir, "index.js"), "module.exports = { hostile: true };\n");
 
-			const mcpPackageJsonPath = join(packageDir, "node_modules", "@modelcontextprotocol", "sdk", "package.json");
-			const bundledMcpPackageJson = JSON.parse(readFileSync(mcpPackageJsonPath, "utf8")) as { version: string };
-			expect(bundledMcpPackageJson.version).toBe("1.30.0");
-			const mcpRequire = createRequire(mcpPackageJsonPath);
-			const resolvedHonoEntry = realpathSync(mcpRequire.resolve("@hono/node-server"));
+			const packageRequire = createRequire(join(packageDir, "package.json"));
+			const resolvedHonoEntry = realpathSync(packageRequire.resolve("@hono/node-server"));
 			const bundledHonoRoot = realpathSync(join(packageDir, "node_modules", "@hono", "node-server"));
 			const hostileHonoRoot = realpathSync(join(hostNodeModules, "@hono", "node-server"));
 			expect(isPathWithin(bundledHonoRoot, resolvedHonoEntry)).toBe(true);
@@ -184,25 +293,13 @@ describe("package metadata cutover baselines", () => {
 			const resolvedVersion = (
 				JSON.parse(readFileSync(join(bundledHonoRoot, "package.json"), "utf8")) as { version: string }
 			).version;
-			expect(resolvedVersion).toBe("2.0.12");
+			expect(resolvedVersion).toBe(packageJson.dependencies["@hono/node-server"]);
 		} finally {
 			rmSync(tempRoot, { recursive: true, force: true });
 		}
 	}, 60_000);
 
-	it("pins pi validation baselines", () => {
-		for (const packageName of PI_PACKAGES) {
-			expect(packageJson.devDependencies[packageName]).toBe("0.84.0");
-			expect(lockPackageVersion(packageName)).toBe("0.84.0");
-		}
-	});
-
-	it("pins Pi 0.84.0's TypeBox validation baseline", () => {
-		expect(packageJson.devDependencies.typebox).toBe("1.3.7");
-		expect(lockPackageVersion("typebox")).toBe("1.3.7");
-	});
-
-	it("tracks Pi 0.84.0 GPT-5.6 Codex metadata", () => {
+	it("tracks installed Pi GPT-5.6 Codex metadata", () => {
 		for (const modelId of ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] as const) {
 			expect(OPENAI_CODEX_MODELS[modelId]).toMatchObject({
 				contextWindow: 272000,

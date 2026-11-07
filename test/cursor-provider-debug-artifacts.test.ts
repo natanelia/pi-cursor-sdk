@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { installCursorProviderVirtualTime } from "./helpers/cursor-provider-virtual-time.js";
 import {
 	resetCursorProviderTestState,
 	makeModel,
@@ -13,22 +14,32 @@ import {
 	registerNativeToolDisplayForTest,
 	createPiHarness,
 } from "./helpers/cursor-provider-harness.js";
-import { streamCursor } from "../src/cursor-provider.js";
+import { streamCursor } from "./helpers/cursor-provider-ownership.js";
 import { registerCursorRuntimeControls } from "../src/cursor-state.js";
+import { registerCursorSessionScope } from "../src/cursor-session-scope.js";
 import { CursorSdkEventDebugSink, __testUtils as sdkEventDebugTestUtils } from "../src/cursor-sdk-event-debug.js";
 import type { SDKMessage } from "@cursor/sdk";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-async function setCursorModeForProviderDebugTest(mode: "agent" | "plan"): Promise<void> {
-	const pi = createPiHarness({ flagValues: { "cursor-mode": mode } });
-	registerCursorRuntimeControls(pi);
+async function setCursorModeForProviderDebugTest(mode: "agent" | "plan", existing?: ReturnType<typeof createPiHarness>) {
+	const pi = existing ?? createPiHarness();
+	if (!existing) {
+		registerCursorSessionScope(pi);
+		registerCursorRuntimeControls(pi);
+	}
+	pi.getFlag.mockImplementation((name) => name === "cursor-mode" ? mode : undefined);
 	await pi.runSessionStart({ model: makeModel("gpt-5.5@1m") });
+	return pi;
 }
 
 describe("streamCursor debug artifacts", () => {
 	beforeEach(resetCursorProviderTestState);
+	installCursorProviderVirtualTime();
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
 
 		it("captures provider debug artifacts through streamCursor when enabled", async () => {
 			const artifactDir = mkdtempSync(join(tmpdir(), "pi-cursor-provider-debug-"));
@@ -95,7 +106,7 @@ describe("streamCursor debug artifacts", () => {
 				send: firstSend,
 				[Symbol.asyncDispose]: vi.fn().mockResolvedValue(undefined),
 			});
-			await setCursorModeForProviderDebugTest("agent");
+			const pi = await setCursorModeForProviderDebugTest("agent");
 			await collectEvents(streamCursor(makeModel("gpt-5.5@1m"), makeContext(), { apiKey: "test-key" }));
 
 			const artifactDir = mkdtempSync(join(tmpdir(), "pi-cursor-provider-mode-debug-"));
@@ -104,7 +115,7 @@ describe("streamCursor debug artifacts", () => {
 			process.env.PI_CURSOR_SDK_EVENT_DEBUG = "1";
 			process.env.PI_CURSOR_SDK_EVENT_DEBUG_RUN_DIR = artifactDir;
 			try {
-				await setCursorModeForProviderDebugTest("plan");
+				await setCursorModeForProviderDebugTest("plan", pi);
 				await collectEvents(streamCursor(makeModel("gpt-5.5@1m"), makeContext(), { apiKey: "test-key" }));
 
 				const metadata = JSON.parse(readFileSync(join(artifactDir, "metadata.json"), "utf8"));

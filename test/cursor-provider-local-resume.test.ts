@@ -17,12 +17,11 @@ import {
 	registerNativeToolDisplayForTest,
 	resetCursorProviderTestState,
 } from "./helpers/cursor-provider-harness.js";
-import { streamCursor } from "../src/cursor-provider.js";
+import { streamCursor } from "./helpers/cursor-provider-ownership.js";
 import { __testUtils as cursorSessionScopeTestUtils } from "../src/cursor-session-scope.js";
-import { __testUtils as cursorSessionAgentTestUtils } from "../src/cursor-session-agent.js";
+import { getRegisteredCursorPiToolBridge } from "../src/cursor-pi-tool-bridge.js";
 import { __testUtils as resumeTestUtils } from "../src/cursor-session-agent-resume.js";
 import { computeCursorContextFingerprint } from "../src/context.js";
-import { buildCursorModelSelection } from "../src/model-discovery.js";
 
 describe("streamCursor local resume", () => {
 	beforeEach(resetCursorProviderTestState);
@@ -34,16 +33,11 @@ describe("streamCursor local resume", () => {
 		incrementalSendCount = 0,
 	): void {
 		cursorSessionScopeTestUtils.set(process.cwd(), scopeKey);
-		const modelSelection = buildCursorModelSelection("gpt-5.5@1m", "off", false);
-		const poolKey = cursorSessionAgentTestUtils.buildSessionAgentPoolKey(scopeKey, {
-			apiKey: "test-key",
-			agentMode: "agent",
-			cwd: process.cwd(),
-			modelSelection,
-			settingSources: ["all"],
-			localSafety: { autoReview: false, sandboxEnabled: false },
-			localResume: true,
-		});
+		// Historical handle bytes for this fixture, independent of the current pool-key builder.
+		const poolKey = [scopeKey, process.cwd(),
+			'{"id":"gpt-5.5","params":[{"id":"context","value":"1m"},{"id":"fast","value":"false"},{"id":"reasoning","value":"none"}]}',
+			"all", '{"autoReview":false,"sandboxEnabled":false}', "http1:default", "62af8704764faf8e",
+			getRegisteredCursorPiToolBridge()?.getToolSurfaceSignature() ?? "bridge:absent"].join("\0");
 		resumeTestUtils.set({
 			scopeKey,
 			sessionFile: scopeKey,
@@ -103,7 +97,7 @@ describe("streamCursor local resume", () => {
 		const prompt = mockSend.mock.calls[0]?.[0] as { text?: string };
 		expect(prompt.text).toContain("User: Follow up");
 		expect(prompt.text).toContain("User: Hello");
-		expect(prompt.text).toContain("prefer pi__mcp for MCP work and pi__subagent for delegation");
+		expect(prompt.text).toContain("prefer matching exposed pi__* tools using their listed names, schemas, and prompt guidelines");
 	});
 
 	it.each([

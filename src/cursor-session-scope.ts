@@ -1,19 +1,33 @@
 import { resolve } from "node:path";
 import { parseArgs } from "@earendil-works/pi-coding-agent";
-import type { ExtensionHandler, ProjectTrustHandler, SessionInfoChangedEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionHandler, ProjectTrustHandler, SessionInfoChangedEvent, SessionStartEvent, SessionShutdownEvent } from "@earendil-works/pi-coding-agent";
 import { truncateCursorDisplayLine } from "./cursor-display-text.js";
 
 interface CursorSessionScopeExtensionApi {
+	getSessionName?(): string | undefined;
 	on(event: "project_trust", handler: ProjectTrustHandler): void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): void;
 	on(event: "session_info_changed", handler: ExtensionHandler<SessionInfoChangedEvent>): void;
+	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
 }
 
 const ANONYMOUS_SESSION_SCOPE_KEY = "__anonymous__";
 const EPHEMERAL_SESSION_SCOPE_PREFIX = "__ephemeral__:";
-export const MAX_CURSOR_SESSION_NAME_LENGTH = 100;
+const MAX_CURSOR_SESSION_NAME_LENGTH = 100;
 
 type CursorSessionScopeChangeHandler = (previousScopeKey: string) => Promise<void> | void;
+
+export interface CursorTurnScope {
+	readonly cwd: string;
+	readonly scopeKey: string;
+	/** Durable identity only; never use it to own live runtime resources. */
+	readonly persistentScopeKey?: string;
+	readonly sessionFile: string | undefined;
+	readonly sessionId: string | undefined;
+	readonly sessionName: string | undefined;
+	readonly projectTrusted: boolean;
+	readonly generation: number;
+}
 
 const state = {
 	sessionCwd: process.cwd(),
@@ -22,49 +36,96 @@ const state = {
 	sessionName: undefined as string | undefined,
 	projectTrusted: false,
 	sessionGeneration: 0,
+	runtimeOwner: undefined as number | undefined,
 };
-
-const scopeGenerations = new Map<string, number>([[ANONYMOUS_SESSION_SCOPE_KEY, state.sessionGeneration]]);
+type ScopeRecord = typeof state;
+const scopes = new Map<object, ScopeRecord>();
+const LIVE_SCOPES_KEY = Symbol.for("pi-cursor-sdk.live-session-scopes.v1");
+const processState = globalThis as typeof globalThis & { [LIVE_SCOPES_KEY]?: Set<WeakRef<CursorSessionScopeExtensionApi>> };
+const liveScopes = processState[LIVE_SCOPES_KEY] ??= new Set<WeakRef<CursorSessionScopeExtensionApi>>();
+const scopeChangeHandlers = new Map<object, CursorSessionScopeChangeHandler>();
+const scopeGenerations = new Map<string, number>([[ANONYMOUS_SESSION_SCOPE_KEY, 0]]);
 const projectTrustResolutionCwds = new Set<string>();
 let nextSessionGeneration = 1;
-let scopeChangeHandler: CursorSessionScopeChangeHandler | undefined;
+let nextRuntimeOwner = 1;
+let runtimeOwners = new WeakMap<object, number>();
 
-/**
- * Pi session file when known; used to scope reused Cursor SDK agents to one pi session.
- */
-export function getCursorSessionFile(): string | undefined {
-	return state.sessionFile;
+function persistentScopeKeyFor(record: Pick<ScopeRecord, "sessionFile" | "sessionId">): string {
+	return record.sessionFile ?? (record.sessionId ? `${EPHEMERAL_SESSION_SCOPE_PREFIX}${record.sessionId}` : ANONYMOUS_SESSION_SCOPE_KEY);
 }
 
-/**
- * Stable scope key for session-agent pooling. Falls back to a process-local anonymous key
- * before the first session_start (tests and early startup).
- */
+function scopeKeyFor(record: ScopeRecord): string {
+	const persistent = persistentScopeKeyFor(record);
+	return record.runtimeOwner === undefined ? persistent : `${persistent}\0runtime:${record.runtimeOwner}`;
+}
+
+export function cursorSessionScopeKeyForManager(manager: {
+	getSessionFile?(): string | undefined | null;
+	getSessionId?(): string | undefined;
+}): string {
+	return persistentScopeKeyFor({
+		sessionFile: manager.getSessionFile?.() ?? undefined, sessionId: manager.getSessionId?.(),
+	});
+}
+
+export function cursorRuntimeSessionScopeKeyForManager(manager: {
+	getSessionFile?(): string | undefined | null;
+	getSessionId?(): string | undefined;
+}): string {
+	const persistent = cursorSessionScopeKeyForManager(manager);
+	const owner = runtimeOwners.get(manager);
+	return owner === undefined ? persistent : `${persistent}\0runtime:${owner}`;
+}
+
+export function getCursorSessionScopeSnapshot(pi?: object): CursorTurnScope {
+	if (!pi && scopes.size > 1) throw new Error("Cursor provider ownership requires a session-bound provider closure when multiple extensions are loaded.");
+	const record = pi ? scopes.get(pi) : state;
+	if (!record) throw new Error("Cursor session binding is no longer active.");
+	const scopeKey = scopeKeyFor(record);
+	return Object.freeze({
+		cwd: record.sessionCwd,
+		scopeKey,
+		persistentScopeKey: persistentScopeKeyFor(record),
+		sessionFile: record.sessionFile,
+		sessionId: record.sessionId,
+		sessionName: record.sessionName,
+		projectTrusted: record.projectTrusted,
+		generation: getCursorSessionScopeGeneration(scopeKey),
+	});
+}
+
+// Pi 1.5.0 AgentSession.dispose() invalidates ExtensionAPI calls; getSessionName then throws the stale-context error below.
+export function isCursorExtensionDisposed(pi: Pick<CursorSessionScopeExtensionApi, "getSessionName">): boolean {
+	if (typeof pi.getSessionName !== "function") return false;
+	try {
+		pi.getSessionName();
+		return false;
+	} catch (error) {
+		return error instanceof Error && error.message.includes("stale after session replacement or reload");
+	}
+}
+
+export function hasLiveCursorSessions(): boolean {
+	let live = false;
+	for (const reference of liveScopes) {
+		const pi = reference.deref();
+		if (pi && !isCursorExtensionDisposed(pi)) live = true;
+		else liveScopes.delete(reference);
+	}
+	return live;
+}
+
+/** Runtime ownership key; persisted identities are captured separately. */
 export function getCursorSessionScopeKey(): string {
-	if (state.sessionFile) return state.sessionFile;
-	if (state.sessionId) return `${EPHEMERAL_SESSION_SCOPE_PREFIX}${state.sessionId}`;
-	return ANONYMOUS_SESSION_SCOPE_KEY;
+	return scopeKeyFor(state);
 }
 
 export function getCursorSessionScopeGeneration(scopeKey: string = getCursorSessionScopeKey()): number {
 	return scopeGenerations.get(scopeKey) ?? 0;
 }
 
-/**
- * Pi session cwd when known; falls back to process.cwd() before session_start.
- * Updated on session_start only until pi threads cwd into streamSimple—mid-session cwd
- * changes without a new session_start event are not reflected here.
- */
-export function getCursorSessionCwd(): string {
-	return state.sessionCwd;
-}
-
-export function getCursorSessionProjectTrusted(): boolean {
-	return state.projectTrusted;
-}
-
-export function getCursorSessionName(): string | undefined {
-	return state.sessionName;
+export function getCursorSessionProjectTrusted(pi?: object): boolean {
+	return pi ? scopes.get(pi)?.projectTrusted === true : state.projectTrusted;
 }
 
 function normalizeCursorSessionName(name: string | undefined): string | undefined {
@@ -78,15 +139,16 @@ function setCursorSessionScope(
 	sessionId?: string,
 	projectTrusted = false,
 	sessionName?: string,
+	runtimeOwner?: number,
 ): void {
 	state.sessionCwd = cwd;
 	state.sessionFile = sessionFile;
 	state.sessionId = sessionId;
 	state.sessionName = normalizeCursorSessionName(sessionName);
 	state.projectTrusted = projectTrusted;
-	state.sessionGeneration = nextSessionGeneration;
-	nextSessionGeneration += 1;
-	scopeGenerations.set(getCursorSessionScopeKey(), state.sessionGeneration);
+	state.sessionGeneration = nextSessionGeneration++;
+	state.runtimeOwner = runtimeOwner;
+	scopeGenerations.set(scopeKeyFor(state), state.sessionGeneration);
 }
 
 function recordProjectTrustResolution(cwd: string): void {
@@ -98,43 +160,71 @@ function isCliProjectTrustApproved(args = process.argv.slice(2)): boolean {
 }
 
 function resetCursorSessionScope(): void {
-	state.sessionCwd = process.cwd();
-	state.sessionFile = undefined;
-	state.sessionId = undefined;
-	state.sessionName = undefined;
-	state.projectTrusted = false;
-	state.sessionGeneration = 0;
+	for (const reference of liveScopes) {
+		const pi = reference.deref();
+		if (!pi || scopes.has(pi)) liveScopes.delete(reference);
+	}
+	Object.assign(state, {
+		sessionCwd: process.cwd(), sessionFile: undefined, sessionId: undefined,
+		sessionName: undefined, projectTrusted: false, sessionGeneration: 0,
+		runtimeOwner: undefined,
+	});
 	nextSessionGeneration = 1;
 	scopeGenerations.clear();
-	scopeGenerations.set(ANONYMOUS_SESSION_SCOPE_KEY, state.sessionGeneration);
+	scopeGenerations.set(ANONYMOUS_SESSION_SCOPE_KEY, 0);
 	projectTrustResolutionCwds.clear();
+	scopes.clear();
+	scopeChangeHandlers.clear();
+	runtimeOwners = new WeakMap();
+	nextRuntimeOwner = 1;
 }
 
-export function onCursorSessionScopeKeyChange(handler: CursorSessionScopeChangeHandler): void {
-	scopeChangeHandler = handler;
+export function onCursorSessionScopeKeyChange(pi: object, handler: CursorSessionScopeChangeHandler): void {
+	scopeChangeHandlers.set(pi, handler);
 }
 
 export function registerCursorSessionScope(pi: CursorSessionScopeExtensionApi): void {
+	// A fresh binding has no previous pooled scope to steal from the last-bound mirror.
+	const record: ScopeRecord = {
+		sessionCwd: process.cwd(), sessionFile: undefined, sessionId: undefined,
+		sessionName: undefined, projectTrusted: false, sessionGeneration: 0,
+		runtimeOwner: undefined,
+	};
+	scopes.set(pi, record);
+	const liveScope = new WeakRef(pi);
+	const trustedCwds = new Set<string>();
 	pi.on("project_trust", (event) => {
-		recordProjectTrustResolution(event.cwd);
+		trustedCwds.add(resolve(event.cwd));
 		return { trusted: "undecided" };
 	});
 	pi.on("session_start", async (_event, ctx) => {
-		const previousScopeKey = getCursorSessionScopeKey();
+		const previousScopeKey = scopeKeyFor(record);
+		const wasBound = record.sessionGeneration > 0;
+		if (!runtimeOwners.has(ctx.sessionManager)) runtimeOwners.set(ctx.sessionManager, nextRuntimeOwner++);
 		setCursorSessionScope(
 			ctx.cwd,
 			ctx.sessionManager?.getSessionFile?.() ?? undefined,
 			ctx.sessionManager?.getSessionId?.() ?? undefined,
 			ctx.isProjectTrusted?.() === true
-				&& (projectTrustResolutionCwds.has(resolve(ctx.cwd)) || isCliProjectTrustApproved()),
+				&& (trustedCwds.has(resolve(ctx.cwd)) || projectTrustResolutionCwds.has(resolve(ctx.cwd)) || isCliProjectTrustApproved()),
 			ctx.sessionManager?.getSessionName?.() ?? undefined,
+			runtimeOwners.get(ctx.sessionManager),
 		);
-		if (previousScopeKey !== getCursorSessionScopeKey()) {
-			await scopeChangeHandler?.(previousScopeKey);
+		Object.assign(record, state);
+		scopes.set(pi, record);
+		liveScopes.add(liveScope);
+		if (wasBound && previousScopeKey !== scopeKeyFor(record)) {
+			await scopeChangeHandlers.get(pi)?.(previousScopeKey);
 		}
 	});
 	pi.on("session_info_changed", (event) => {
-		state.sessionName = normalizeCursorSessionName(event.name);
+		record.sessionName = normalizeCursorSessionName(event.name);
+		Object.assign(state, record);
+	});
+	pi.on("session_shutdown", () => {
+		liveScopes.delete(liveScope);
+		scopes.delete(pi);
+		scopeChangeHandlers.delete(pi);
 	});
 }
 

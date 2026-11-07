@@ -1,4 +1,5 @@
 import type { Context, ToolResultMessage } from "@earendil-works/pi-ai";
+import { getCursorConversationMessages } from "./cursor-pi-context.js";
 import type { SDKAgent } from "@cursor/sdk";
 import {
 	consumeCursorLiveToolResults,
@@ -10,7 +11,7 @@ import {
 	type CursorLiveToolResultConsumption,
 } from "./cursor-live-run-accounting.js";
 import type { CursorSdkTurnUsage } from "./cursor-usage-accounting.js";
-import type { CursorNativeToolDisplayItem } from "./cursor-native-tool-display-state.js";
+import type { CursorNativeToolDisplayItem, CursorNativeToolDisplayState } from "./cursor-native-tool-display-state.js";
 import type { CursorPiBridgeToolRequest, CursorPiToolBridgeRun } from "./cursor-pi-tool-bridge.js";
 import { getCursorSessionScopeKey } from "./cursor-session-scope.js";
 import type { CursorSdkEventDebugRecorder } from "./cursor-sdk-event-debug.js";
@@ -27,6 +28,7 @@ export type CursorLiveQueuedEvent =
 	| { type: "thinking-delta"; text: string }
 	| { type: "thinking-completed" }
 	| { type: "text-delta"; text: string }
+	| { type: "text-completed" }
 	| { type: "tool"; tool: CursorNativeToolDisplayItem }
 	| { type: "bridge-tool"; request: CursorPiBridgeToolRequest };
 
@@ -37,13 +39,15 @@ export interface CursorLiveSdkRun {
 export interface CursorLiveRun {
 	id: string;
 	agent: SDKAgent;
+	/** Effective ordinary main-loop policy captured when this SDK run was created. */
+	nativeToolsEnabled?: boolean;
 	bridgeRun?: CursorPiToolBridgeRun;
 	sessionBridgeRun?: CursorPiToolBridgeRun;
 	sessionAgentScopeKey: string;
 	sdkRun?: CursorLiveSdkRun;
 	ignoreFutureSdkTurnUsage?: boolean;
 	accounting: CursorLiveRunAccountingState;
-	billedTurnUsage?: CursorSdkTurnUsage;
+	onAbandon?: () => Promise<void>;
 	pendingEvents: CursorLiveQueuedEvent[];
 	textDeltas: string[];
 	emittedText: string;
@@ -57,17 +61,21 @@ export interface CursorLiveRun {
 	abortMessage?: string;
 	chainUserInputAfterCompletion: boolean;
 	debugRecorder?: CursorSdkEventDebugRecorder;
+	nativeDisplay?: CursorNativeToolDisplayState;
 }
 
 export interface CursorLiveRunCreateParams {
 	id: string;
 	agent: SDKAgent;
+	/** Effective ordinary main-loop policy captured when this SDK run was created. */
+	nativeToolsEnabled?: boolean;
 	bridgeRun?: CursorPiToolBridgeRun;
 	sessionBridgeRun?: CursorPiToolBridgeRun;
 	sessionAgentScopeKey?: string;
 	promptInputTokens: number;
 	textDeltas?: string[];
 	debugRecorder?: CursorSdkEventDebugRecorder;
+	nativeDisplay?: CursorNativeToolDisplayState;
 }
 
 export interface CursorLiveRunCoordinatorDeps {
@@ -94,7 +102,7 @@ export interface CursorLiveRunCoordinator {
 	consumeToolResults(run: CursorLiveRun, context: Context, getReplayId: CursorReplayIdResolver): CursorLiveToolResultConsumption;
 	takeTurnInputTokens(run: CursorLiveRun, toolResultInputTokens: number): number;
 	takeSdkTurnUsage(run: CursorLiveRun): CursorSdkTurnUsage | undefined;
-	getPendingFromContext(context: Context, getReplayId: CursorReplayIdResolver): CursorLiveRun | undefined;
+	getPendingFromContext(context: Context, getReplayId: CursorReplayIdResolver, scopeKey: string): CursorLiveRun | undefined;
 	getActiveForScope(scopeKey?: string): CursorLiveRun | undefined;
 	isReady(run: CursorLiveRun): boolean;
 	waitForProgress(run: CursorLiveRun, signal?: AbortSignal): Promise<void>;
@@ -149,22 +157,24 @@ interface CursorLiveRunPrivateState {
 	waiters: Set<ProgressWaiter>;
 	idleDisposeTimer?: ReturnType<typeof setTimeout>;
 	idleDisposeRequested: boolean;
+	pendingCallUnsubscribers?: Array<() => void>;
 	leased: boolean;
 	leaseQueue: LeaseWaiter[];
 	releasing?: Promise<void>;
 }
 
 export function hasTrailingUserMessagesAfterToolResults(context: Context): boolean {
-	let index = context.messages.length - 1;
+	const messages = getCursorConversationMessages(context);
+	let index = messages.length - 1;
 	let sawTrailingUser = false;
-	while (index >= 0 && context.messages[index]?.role === "user") {
+	while (index >= 0 && messages[index]?.role === "user") {
 		sawTrailingUser = true;
 		index -= 1;
 	}
 	if (!sawTrailingUser) return false;
 
 	let sawToolResult = false;
-	while (index >= 0 && context.messages[index]?.role === "toolResult") {
+	while (index >= 0 && messages[index]?.role === "toolResult") {
 		sawToolResult = true;
 		index -= 1;
 	}
@@ -287,9 +297,11 @@ export function createCursorLiveRunCoordinator(deps: CursorLiveRunCoordinatorDep
 			const run: CursorLiveRun = {
 				id: params.id,
 				agent: params.agent,
+				nativeToolsEnabled: params.nativeToolsEnabled !== false,
 				bridgeRun: params.bridgeRun,
 				sessionBridgeRun: params.sessionBridgeRun,
 				sessionAgentScopeKey,
+				nativeDisplay: params.nativeDisplay,
 				accounting: createCursorLiveRunAccountingState(params.promptInputTokens),
 				pendingEvents: [],
 				textDeltas: params.textDeltas ?? [],
@@ -307,6 +319,12 @@ export function createCursorLiveRunCoordinator(deps: CursorLiveRunCoordinatorDep
 				leased: false,
 				leaseQueue: [],
 			});
+			const state = getPrivateState(run);
+			state.pendingCallUnsubscribers = [...new Set([run.bridgeRun, run.sessionBridgeRun])].flatMap((bridge) =>
+				bridge ? [bridge.onPendingToolCallsChanged(() => {
+					if (state.idleDisposeRequested || state.idleDisposeTimer) coordinator.requestIdleDispose(run);
+				})] : [],
+			);
 			pendingRuns.set(run.id, run);
 			pendingRunIdsByScopeKey.set(sessionAgentScopeKey, run.id);
 			return run;
@@ -417,24 +435,19 @@ export function createCursorLiveRunCoordinator(deps: CursorLiveRunCoordinatorDep
 			return taken.sdkTurnUsage;
 		},
 
-		getPendingFromContext(context, getReplayId): CursorLiveRun | undefined {
-			let index = context.messages.length - 1;
-			while (index >= 0 && context.messages[index]?.role === "user") {
+		getPendingFromContext(context, getReplayId, scopeKey): CursorLiveRun | undefined {
+			const run = getUndisposed(pendingRunIdsByScopeKey.get(scopeKey));
+			if (!run) return undefined;
+			const messages = getCursorConversationMessages(context);
+			let index = messages.length - 1;
+			while (index >= 0 && messages[index]?.role === "user") {
 				index -= 1;
 			}
 
 			for (; index >= 0; index -= 1) {
-				const message = context.messages[index];
+				const message = messages[index];
 				if (message.role !== "toolResult") break;
-				const replayId = getReplayId(message.toolCallId);
-				if (replayId) {
-					const replayRun = getUndisposed(replayId);
-					if (replayRun) return replayRun;
-				}
-				for (const run of pendingRuns.values()) {
-					if (run.disposed) continue;
-					if (run.bridgeRun?.hasPendingPiToolCallId(message.toolCallId)) return run;
-				}
+				if (matchesCursorLiveRunToolResult(run, message, getReplayId)) return run;
 			}
 			return undefined;
 		},
@@ -491,9 +504,15 @@ export function createCursorLiveRunCoordinator(deps: CursorLiveRunCoordinatorDep
 			const state = getPrivateState(run);
 			clearIdleDisposeTimer(run);
 			state.idleDisposeRequested = true;
-			if (state.leased || state.leaseQueue.length > 0) return;
-			state.idleDisposeRequested = false;
+			if (state.leased || state.leaseQueue.length > 0 ||
+				[run.bridgeRun, run.sessionBridgeRun].some((bridge) => bridge?.hasPendingToolCalls())) return;
 			state.idleDisposeTimer = setTimeout(() => {
+				state.idleDisposeTimer = undefined;
+				if (state.leased || state.leaseQueue.length > 0 ||
+					[run.bridgeRun, run.sessionBridgeRun].some((bridge) => bridge?.hasPendingToolCalls())) {
+					coordinator.requestIdleDispose(run);
+					return;
+				}
 				void coordinator.release(run).catch(() => {
 					// Idle dispose must not leave release failures as unhandled rejections.
 				});
@@ -508,6 +527,12 @@ export function createCursorLiveRunCoordinator(deps: CursorLiveRunCoordinatorDep
 				if (run.disposed) return;
 				const abandoned = !isSuccessfulCursorLiveRun(run);
 				run.disposed = true;
+				for (const unsubscribe of state.pendingCallUnsubscribers ?? []) {
+					try { unsubscribe(); } catch {
+						// Cleanup continues even if an observer cannot detach.
+					}
+				}
+				state.pendingCallUnsubscribers = [];
 				unregister(run);
 				clearIdleDisposeTimer(run);
 				state.idleDisposeRequested = false;
@@ -527,11 +552,13 @@ export function createCursorLiveRunCoordinator(deps: CursorLiveRunCoordinatorDep
 				}
 				if (abandoned) {
 					if (!run.done) {
+						const usageCompletion = run.onAbandon?.();
 						try {
 							await cancelCursorLiveSdkRun(run);
 						} catch {
 							// cancellation failure should not block session-agent abandonment
 						}
+						await usageCompletion;
 					}
 					await deps.abandonSessionAgent(run.sessionAgentScopeKey);
 				}

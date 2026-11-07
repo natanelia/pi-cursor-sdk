@@ -49,6 +49,7 @@ export function buildCursorCloudAgentOptions(options: {
 	agentMode: AgentModeOption;
 	resolvedConfig: CursorResolvedSdkConfig;
 	name?: string;
+	agents?: AgentOptions["agents"];
 }): AgentOptions {
 	const { resolvedConfig } = options;
 	const environment = resolvedConfig.cloud.environment.value;
@@ -91,6 +92,7 @@ export function buildCursorCloudAgentOptions(options: {
 		model: options.modelSelection,
 		mode: options.agentMode,
 		...(options.name ? { name: options.name } : {}),
+		...(options.agents && Object.keys(options.agents).length ? { agents: options.agents } : {}),
 		cloud,
 	};
 }

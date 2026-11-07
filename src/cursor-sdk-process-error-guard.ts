@@ -1,16 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { classifyCursorConnectError, isCursorSdkAbortConnectError, isCursorSdkConnectionStalledError } from "./cursor-provider-errors.js";
+import { classifyCursorConnectError, isCursorSdkConnectionStalledError } from "./cursor-provider-errors.js";
 
 interface CursorSdkProcessErrorGuardToken {
 	suppressAbortErrors: boolean;
-	onLocalTransportClosedPipe?: () => void;
 }
 
 interface CursorSdkSessionProcessErrorGuardToken {}
 
 export interface CursorSdkProcessErrorGuard {
 	suppressAbortErrors(): void;
-	containLocalTransportClosedPipe(onClosedPipe: () => void): void;
 	dispose(): void;
 }
 
@@ -25,7 +23,7 @@ type GenericProcessEmit = (event: string | symbol, ...args: unknown[]) => boolea
 // ConnectRPC suppression remains scoped to active provider turns.
 const activeProviderTurns = new Set<CursorSdkProcessErrorGuardToken>();
 const activeSessions = new Set<CursorSdkSessionProcessErrorGuardToken>();
-let activeLifecycleSessionGuard: CursorSdkSessionProcessErrorGuard | undefined;
+const lifecycleSessionGuards = new Map<object, CursorSdkSessionProcessErrorGuard>();
 let originalProcessEmit: GenericProcessEmit | undefined;
 let cursorProcessEmit: GenericProcessEmit | undefined;
 let bunUnhandledRejectionListenerInstalled = false;
@@ -42,7 +40,7 @@ function hasActiveAbortSuppression(): boolean {
 }
 
 function isCursorProvenance(source: string): boolean {
-	return source === "cursor-sdk-stack" || source === "cursor-extension-connect-stack" || source === "cursor-backend-details";
+	return source === "cursor-sdk-stack" || source === "cursor-backend-details";
 }
 
 function isCursorSdkWriteIterableClosedError(error: unknown): boolean {
@@ -72,48 +70,9 @@ function isCursorSdkAbortError(error: unknown): boolean {
 	);
 }
 
-// The exact observed incident: the Cursor SDK 1.0.23 local shell executor writes a
-// spawned child's stdin without a stream 'error' listener, so a child exiting while
-// a write is in flight surfaces a raw `write EPIPE` uncaught exception whose stack
-// is exactly the single async pipe-write completion frame. Installed 1.0.27 attaches
-// a no-op `error` listener before that write; keep this guard as defense in depth.
-// Pi's own piped-stdout or dead-terminal EPIPE normally surfaces through the
-// synchronous write-dispatch path with multiple frames (afterWriteDispatched /
-// Socket._writeGeneric) and must stay fatal per Unix convention, so anything beyond
-// this one-frame contract is rejected.
-const OBSERVED_CLOSED_PIPE_STACK_FRAME =
-	/^\s+at WriteWrap\.onWriteComplete \[as oncomplete\] \(node:internal\/stream_base_commons:\d+:\d+\)$/;
-
-function isObservedLocalTransportClosedPipeWriteError(error: unknown): boolean {
-	if (!(error instanceof Error) || error.name !== "Error") return false;
-	const { code, syscall } = error as NodeJS.ErrnoException;
-	if (code !== "EPIPE" || syscall !== "write" || !error.message.startsWith("write EPIPE")) return false;
-	const frames = (error.stack ?? "").split("\n").filter((line) => /^\s+at /.test(line));
-	return frames.length === 1 && OBSERVED_CLOSED_PIPE_STACK_FRAME.test(frames[0] ?? "");
-}
-
-// Contained only while a provider turn that declared a local transport is active;
-// each contained turn invalidates its own session-agent scope for recreation.
-function containLocalTransportClosedPipeError(): boolean {
-	let contained = false;
-	for (const turn of [...activeProviderTurns]) {
-		if (!turn.onLocalTransportClosedPipe) continue;
-		contained = true;
-		try {
-			turn.onLocalTransportClosedPipe();
-		} catch {
-			// stale-agent invalidation must not throw inside process error handling
-		}
-	}
-	return contained;
-}
-
 function shouldSuppressProcessError(event: string | symbol, args: readonly unknown[]): boolean {
 	if (event !== "uncaughtException" && event !== "unhandledRejection") return false;
 	const error = args[0];
-	if (isObservedLocalTransportClosedPipeWriteError(error)) {
-		return containLocalTransportClosedPipeError();
-	}
 	if (isCursorSdkWriteIterableClosedError(error)) return activeSessions.size > 0;
 	// SDK stall timers and inter-turn teardown aborts never call suppressAbortErrors();
 	// any active provider turn or session is enough — stack provenance already gates SDK-only AbortErrors.
@@ -124,7 +83,6 @@ function shouldSuppressProcessError(event: string | symbol, args: readonly unkno
 	if (!classification) return false;
 	if (classification.kind === "abort") return hasActiveAbortSuppression();
 	if (activeProviderTurns.size === 0) return false;
-	if (classification.kind === "network") return isCursorProvenance(classification.source) || classification.source === "connect-node-stack";
 	return isCursorProvenance(classification.source);
 }
 
@@ -184,12 +142,10 @@ export const __testUtils = {
 	activeProviderTurnCount: (): number => activeProviderTurns.size,
 	activeSessionCount: (): number => activeSessions.size,
 	resetLifecycleSessionGuard(): void {
-		activeLifecycleSessionGuard?.dispose();
-		activeLifecycleSessionGuard = undefined;
+		for (const guard of lifecycleSessionGuards.values()) guard.dispose();
+		lifecycleSessionGuards.clear();
 	},
 };
-
-export { isCursorSdkAbortConnectError };
 
 export function installCursorSdkProcessErrorGuard(): CursorSdkProcessErrorGuard {
 	const token: CursorSdkProcessErrorGuardToken = { suppressAbortErrors: false };
@@ -200,10 +156,6 @@ export function installCursorSdkProcessErrorGuard(): CursorSdkProcessErrorGuard 
 		suppressAbortErrors(): void {
 			if (disposed) return;
 			token.suppressAbortErrors = true;
-		},
-		containLocalTransportClosedPipe(onClosedPipe: () => void): void {
-			if (disposed) return;
-			token.onLocalTransportClosedPipe = onClosedPipe;
 		},
 		dispose(): void {
 			if (disposed) return;
@@ -231,11 +183,11 @@ export function installCursorSdkSessionProcessErrorGuard(): CursorSdkSessionProc
 
 export function registerCursorSdkSessionProcessErrorGuard(pi: Pick<ExtensionAPI, "on">): void {
 	pi.on("session_start", () => {
-		activeLifecycleSessionGuard?.dispose();
-		activeLifecycleSessionGuard = installCursorSdkSessionProcessErrorGuard();
+		lifecycleSessionGuards.get(pi)?.dispose();
+		lifecycleSessionGuards.set(pi, installCursorSdkSessionProcessErrorGuard());
 	});
 	pi.on("session_shutdown", () => {
-		activeLifecycleSessionGuard?.dispose();
-		activeLifecycleSessionGuard = undefined;
+		lifecycleSessionGuards.get(pi)?.dispose();
+		lifecycleSessionGuards.delete(pi);
 	});
 }

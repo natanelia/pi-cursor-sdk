@@ -22,45 +22,36 @@ import {
 	CURSOR_LOCAL_FORCE_ENV,
 	CURSOR_LOCAL_RESUME_ENV,
 	CURSOR_HTTP1_ENV,
+	CURSOR_STATE_ROOT_ENV,
 	cursorFastDefaultsFromConfig,
 	getCursorSdkProjectConfigPath,
 	getCursorSdkUserConfigPath,
 	loadCursorSdkConfig,
-	loadCursorSdkConfigForUpdate,
 	loadCursorSdkUserConfig,
-	mergeCursorSdkConfig,
+	mergeCursorSdkConfigForUpdate,
+	parseCursorSdkConfig,
 	resolveCursorFastDefault,
 	resolveCursorSdkConfig,
-	saveCursorSdkProjectConfig,
-	saveCursorSdkUserConfig,
 	updateCursorSdkConfig,
-	withCursorFastDefaults,
 } from "../src/cursor-config.js";
 
 function runConfigWriter(
 	path: string,
 	gatePath: string,
 	key: string,
-): Promise<{ code: number | null; output: string }> {
+) {
 	const child = spawn(
 		process.execPath,
-		[resolve("node_modules/vitest/vitest.mjs"), "run", "test/fixtures/cursor-config-writer.test.ts", "--reporter=dot"],
-		{
-			cwd: process.cwd(),
-			env: {
-				...process.env,
-				PI_CURSOR_CONFIG_WRITER_PATH: path,
-				PI_CURSOR_CONFIG_WRITER_GATE: gatePath,
-				PI_CURSOR_CONFIG_WRITER_KEY: key,
-			},
-		},
+		[resolve("test/fixtures/cursor-config-writer.mjs"), path, gatePath, key],
 	);
 	let output = "";
 	child.stdout?.on("data", (chunk) => { output += chunk; });
 	child.stderr?.on("data", (chunk) => { output += chunk; });
-	return new Promise((done) => {
+	const result = new Promise<{ code: number | null; output: string }>((done, reject) => {
+		child.on("error", reject);
 		child.on("close", (code) => done({ code, output }));
 	});
+	return { child, result, output: () => output };
 }
 
 describe("Cursor SDK config resolver", () => {
@@ -79,7 +70,45 @@ describe("Cursor SDK config resolver", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
-	it("resolves ordinary settings by CLI, env, trusted project, user, built-in order", () => {
+	it("validates named subagents individually without forwarding unsupported fields", () => {
+		const valid = { description: " Review ", prompt: " Be thorough ", model: " inherit ", thinking: "max", fast: false, mcpServers: ["secret"] };
+		const parsed = parseCursorSdkConfig({ subagents: {
+			reviewer: valid, constructor: valid, toString: valid,
+			optional: { description: "D", prompt: "P", model: 1, thinking: "ultra", fast: "true" },
+			"bad name": valid, ["a".repeat(65)]: valid, "1start": valid,
+			empty: { description: " ", prompt: "P" }, missing: { description: "D" }, array: [], nil: null,
+		} });
+		const expected = { description: "Review", prompt: "Be thorough", model: "inherit", thinking: "max", fast: false };
+		expect(parsed?.subagents).toEqual({
+			reviewer: expected, constructor: expected, toString: expected, optional: { description: "D", prompt: "P" },
+		});
+		expect(Object.hasOwn(parsed!.subagents!, "constructor")).toBe(true);
+	});
+
+	it("replaces the whole user subagent set only with a usable trusted project set", () => {
+		const user = { subagents: { userAgent: { description: "D", prompt: "P" } } };
+		const project = { subagents: { projectAgent: { description: "Other", prompt: "P" } } };
+		expect(resolveCursorSdkConfig({ env: {}, user, project }).subagents).toEqual({
+			value: project.subagents, source: "project", trustLevel: "trusted-project",
+		});
+		for (const project of [{ subagents: {} }, { subagents: { invalid: { description: "", prompt: "P" } } }]) {
+			expect(resolveCursorSdkConfig({ env: {}, user, project: parseCursorSdkConfig(project) }).subagents.value).toEqual(user.subagents);
+		}
+		expect(resolveCursorSdkConfig({ env: { PI_CURSOR_SUBAGENTS: JSON.stringify(project.subagents) }, cli: project, session: project, builtIn: project }).subagents.value).toBeUndefined();
+
+		updateCursorSdkConfig(getCursorSdkUserConfigPath(agentDir), () => user, { newFileMode: 0o600 });
+		updateCursorSdkConfig(getCursorSdkProjectConfigPath(cwd), () => project);
+		const loaded = loadCursorSdkConfig({ cwd, agentDir, projectTrusted: false });
+		expect(resolveCursorSdkConfig({ env: {}, ...loaded }).subagents.value).toEqual(user.subagents);
+		expect(resolveCursorSdkConfig({ env: {}, ...loadCursorSdkConfig({ cwd, agentDir, projectTrusted: true }) }).subagents.value).toEqual(project.subagents);
+		updateCursorSdkConfig(getCursorSdkUserConfigPath(agentDir), current => ({
+			...mergeCursorSdkConfigForUpdate(current, { runtime: "local", local: { useHttp1ForAgent: true } }),
+			fastDefaults: { "composer-2": false },
+		}));
+		expect(loadCursorSdkUserConfig(getCursorSdkUserConfigPath(agentDir)).subagents).toEqual(user.subagents);
+	});
+
+	it("resolves runtime by CLI, env, session, trusted project, user, built-in order", () => {
 		const user = { runtime: "cloud" as const };
 		const project = { runtime: "local" as const };
 
@@ -97,6 +126,18 @@ describe("Cursor SDK config resolver", () => {
 			resolveCursorSdkConfig({ cli: { runtime: "local" }, env: { [CURSOR_RUNTIME_ENV]: "cloud" }, user, project }).runtime,
 		).toMatchObject({ value: "local", source: "cli", trustLevel: "one-shot" });
 		expect(resolveCursorSdkConfig().runtime).toMatchObject({ value: "local", source: "builtin" });
+		expect(resolveCursorSdkConfig({ session: { runtime: "cloud" }, project: { runtime: "local" } }).runtime).toMatchObject({
+			value: "cloud",
+			source: "session",
+		});
+		expect(resolveCursorSdkConfig({ env: { [CURSOR_RUNTIME_ENV]: "local" }, session: { runtime: "cloud" } }).runtime).toMatchObject({
+			value: "local",
+			source: "environment",
+		});
+		expect(resolveCursorSdkConfig({ cli: { runtime: "local" }, session: { runtime: "cloud" } }).runtime).toMatchObject({
+			value: "local",
+			source: "cli",
+		});
 	});
 
 	it("resolves HTTP/1.1 as session, env, user, then byte-identical default", () => {
@@ -127,7 +168,25 @@ describe("Cursor SDK config resolver", () => {
 		});
 	});
 
-	it("rejects invalid explicit CLI runtime and cloud-context overrides before lower layers", () => {
+	it("selects persistent storage only from environment or user and preserves invalid winners across saves", () => {
+		const other = { local: { storeRoot: join(root, "ignored") } };
+		const layers = { env: {}, cli: other, project: other, session: other, builtIn: other };
+		expect(resolveCursorSdkConfig(layers).local.storeRoot).toMatchObject({ value: undefined, source: "builtin" });
+		const user = { local: { storeRoot: join(root, "user") } };
+		expect(resolveCursorSdkConfig({ ...layers, user }).local.storeRoot).toMatchObject({ value: user.local.storeRoot, source: "user" });
+		expect(resolveCursorSdkConfig({ ...layers, user, env: { [CURSOR_STATE_ROOT_ENV]: "relative/invalid" } }).local.storeRoot)
+			.toMatchObject({ value: "relative/invalid", source: "environment" });
+		expect(resolveCursorSdkConfig({ ...layers, user, env: { [CURSOR_STATE_ROOT_ENV]: "  " } }).local.storeRoot)
+			.toMatchObject({ value: user.local.storeRoot, source: "user" });
+		const path = getCursorSdkUserConfigPath(agentDir);
+		updateCursorSdkConfig(path, () => ({ local: { storeRoot: "~/invalid" } }), { newFileMode: 0o600 });
+		updateCursorSdkConfig(path, current => mergeCursorSdkConfigForUpdate(current, { local: { resume: false } }));
+		expect(resolveCursorSdkConfig({ env: {}, user: loadCursorSdkUserConfig(path) }).local.storeRoot)
+			.toMatchObject({ value: "~/invalid", source: "user" });
+		expect(existsSync(join(root, "user"))).toBe(false);
+	});
+
+	it("rejects invalid explicit CLI and env runtime and cloud-context overrides before lower layers", () => {
 		expect(() => resolveCursorSdkConfig({
 			cli: { runtime: "remote" },
 			env: { [CURSOR_RUNTIME_ENV]: "cloud" },
@@ -136,9 +195,6 @@ describe("Cursor SDK config resolver", () => {
 			cli: { cloud: { contextHandoff: "reuse" } },
 			user: { cloud: { contextHandoff: "bootstrap" } },
 		})).toThrow('Invalid --cursor-cloud-context "reuse". Use "never", "fresh", or "bootstrap".');
-	});
-
-	it("rejects invalid explicit env runtime and cloud-context overrides before lower config", () => {
 		expect(() => resolveCursorSdkConfig({
 			env: { [CURSOR_RUNTIME_ENV]: "remote" },
 			user: { runtime: "cloud" },
@@ -174,7 +230,7 @@ describe("Cursor SDK config resolver", () => {
 		expect(cursorFastDefaultsFromConfig(config)).toEqual(new Map([["composer-2", false]]));
 
 		const savedPath = join(agentDir, "saved-cursor-sdk.json");
-		saveCursorSdkUserConfig(withCursorFastDefaults(config, new Map([["composer-2", true]])), savedPath);
+		updateCursorSdkConfig(savedPath, () => ({ ...config, fastDefaults: { "composer-2": true } }), { newFileMode: 0o600 });
 		expect(JSON.parse(readFileSync(savedPath, "utf-8"))).toEqual({ fastDefaults: { "composer-2": true } });
 		if (process.platform !== "win32") expect(statSync(savedPath).mode & 0o777).toBe(0o600);
 	});
@@ -191,8 +247,8 @@ describe("Cursor SDK config resolver", () => {
 			chmodSync(projectPath, 0o640);
 		}
 
-		saveCursorSdkUserConfig({ runtime: "cloud" }, userPath);
-		saveCursorSdkProjectConfig(cwd, { runtime: "local" });
+		updateCursorSdkConfig(userPath, () => ({ runtime: "cloud" }), { newFileMode: 0o600 });
+		updateCursorSdkConfig(projectPath, () => ({ runtime: "local" }));
 
 		expect(JSON.parse(readFileSync(userPath, "utf8"))).toEqual({ runtime: "cloud" });
 		expect(JSON.parse(readFileSync(projectPath, "utf8"))).toEqual({ runtime: "local" });
@@ -208,7 +264,7 @@ describe("Cursor SDK config resolver", () => {
 		const newCwd = join(root, "new-repo");
 		mkdirSync(newCwd);
 
-		saveCursorSdkProjectConfig(newCwd, { runtime: "local" });
+		updateCursorSdkConfig(getCursorSdkProjectConfigPath(newCwd), () => ({ runtime: "local" }));
 
 		expect(statSync(getCursorSdkProjectConfigPath(newCwd)).mode & 0o777).toBe(0o666 & ~process.umask());
 	});
@@ -239,44 +295,31 @@ describe("Cursor SDK config resolver", () => {
 		expect(loadCursorSdkConfig({ cwd, agentDir, projectTrusted: true })).toEqual({ user: {}, project: { runtime: "cloud" } });
 	});
 
-	it("loads raw config objects for updates and rejects invalid files", () => {
-		const path = getCursorSdkUserConfigPath(agentDir);
-		mkdirSync(agentDir, { recursive: true });
-		writeFileSync(path, JSON.stringify({ runtime: "local", future: { enabled: true } }));
-		expect(loadCursorSdkConfigForUpdate(path)).toEqual({ runtime: "local", future: { enabled: true } });
-
-		const sentinel = "PI_CURSOR_MALFORMED_SECRET";
-		writeFileSync(path, `{"secret":"${sentinel}`);
-		let malformedError: unknown;
-		try {
-			loadCursorSdkConfigForUpdate(path);
-		} catch (error) {
-			malformedError = error;
-		}
-		expect(malformedError).toBeInstanceOf(Error);
-		expect((malformedError as Error).message).toContain("Invalid JSON in Cursor SDK config");
-		expect((malformedError as Error).message).not.toContain(sentinel);
-		writeFileSync(path, "[]");
-		expect(() => loadCursorSdkConfigForUpdate(path)).toThrow("expected a JSON object");
-	});
-
 	it("serializes two process writers without losing unrelated fields", async () => {
 		const path = getCursorSdkUserConfigPath(agentDir);
 		const gatePath = join(root, "writer-gate");
 		const first = runConfigWriter(path, gatePath, "writerA");
 		const second = runConfigWriter(path, gatePath, "writerB");
-		await vi.waitFor(() => {
-			expect(existsSync(`${gatePath}.writerA.started`)).toBe(true);
-			expect(existsSync(`${gatePath}.writerB.started`)).toBe(true);
-			expect(
-				Number(existsSync(`${gatePath}.writerA.ready`)) + Number(existsSync(`${gatePath}.writerB.ready`)),
-			).toBe(1);
-		}, { timeout: 20_000, interval: 20 });
-		writeFileSync(gatePath, "go");
-		const results = await Promise.all([first, second]);
-		for (const result of results) expect(result.code, result.output).toBe(0);
-		expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ writerA: true, writerB: true });
-		expect(existsSync(`${path}.lock`)).toBe(false);
+		try {
+			await vi.waitFor(() => {
+				const output = `${first.output()}${second.output()}`;
+				expect(existsSync(`${gatePath}.writerA.started`), output).toBe(true);
+				expect(existsSync(`${gatePath}.writerB.started`), output).toBe(true);
+				expect(
+					Number(existsSync(`${gatePath}.writerA.ready`)) + Number(existsSync(`${gatePath}.writerB.ready`)),
+					output,
+				).toBe(1);
+			}, { timeout: 20_000, interval: 20 });
+			writeFileSync(gatePath, "go");
+			const results = await Promise.all([first.result, second.result]);
+			for (const result of results) expect(result.code, result.output).toBe(0);
+			expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ writerA: true, writerB: true });
+			expect(existsSync(`${path}.lock`)).toBe(false);
+		} finally {
+			first.child.kill();
+			second.child.kill();
+			await Promise.allSettled([first.result, second.result]);
+		}
 	}, 60_000);
 
 	it("times out without changing config or removing an existing lock", () => {
@@ -284,16 +327,26 @@ describe("Cursor SDK config resolver", () => {
 		mkdirSync(agentDir, { recursive: true });
 		writeFileSync(path, '{"runtime":"local"}\n');
 		writeFileSync(`${path}.lock`, "existing");
+		vi.useFakeTimers({ toFake: ["Date"] });
+		const started = Date.now();
+		const wait = vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, timeout) => {
+			vi.setSystemTime(Date.now() + Number(timeout));
+			return "timed-out";
+		});
 		try {
 			expect(() => updateCursorSdkConfig(path, (current) => ({ ...current, runtime: "cloud" }))).toThrow(
 				"Timed out waiting for Cursor SDK config lock",
 			);
 			expect(readFileSync(path, "utf8")).toBe('{"runtime":"local"}\n');
 			expect(readFileSync(`${path}.lock`, "utf8")).toBe("existing");
+			expect(Date.now() - started).toBeGreaterThanOrEqual(5_000);
+			expect(Date.now() - started).toBeLessThan(5_100);
 		} finally {
+			wait.mockRestore();
+			vi.useRealTimers();
 			rmSync(`${path}.lock`, { force: true });
 		}
-	}, 10_000);
+	});
 
 	it("cleans locks and temporary files on update, parse, and replacement failures", () => {
 		const path = getCursorSdkUserConfigPath(agentDir);
@@ -306,6 +359,11 @@ describe("Cursor SDK config resolver", () => {
 		writeFileSync(path, "{invalid");
 		expect(() => updateCursorSdkConfig(path, (current) => current)).toThrow("Invalid JSON in Cursor SDK config");
 		expect(readFileSync(path, "utf8")).toBe("{invalid");
+		expect(existsSync(`${path}.lock`)).toBe(false);
+
+		writeFileSync(path, "[]");
+		expect(() => updateCursorSdkConfig(path, current => current)).toThrow("expected a JSON object");
+		expect(readFileSync(path, "utf8")).toBe("[]");
 		expect(existsSync(`${path}.lock`)).toBe(false);
 
 		writeFileSync(path, '{}\n');
@@ -511,8 +569,7 @@ describe("Cursor SDK config resolver", () => {
 		const path = getCursorSdkUserConfigPath(agentDir);
 		writeFileSync(path, `${JSON.stringify({ cloud: { environment: { type: "poll" } } }, null, 2)}\n`);
 
-		const loaded = loadCursorSdkUserConfig(path);
-		saveCursorSdkUserConfig(mergeCursorSdkConfig(loaded, { runtime: "cloud" }), path);
+		updateCursorSdkConfig(path, current => mergeCursorSdkConfigForUpdate(current, { runtime: "cloud" }));
 
 		expect(JSON.parse(readFileSync(path, "utf8")).cloud.environment).toEqual({ type: "poll" });
 		expect(loadCursorSdkUserConfig(path).cloud?.environment).toEqual({ type: "poll" });
@@ -520,7 +577,7 @@ describe("Cursor SDK config resolver", () => {
 
 	it("merges nested cursor sdk config", () => {
 		expect(
-			mergeCursorSdkConfig(
+			mergeCursorSdkConfigForUpdate(
 				{ runtime: "local", cloud: { repo: "repo", environment: { type: "pool" }, acknowledged: false }, local: { sandboxOptions: { enabled: true } } },
 				{ runtime: "cloud", cloud: { environment: { name: "gpu" }, acknowledged: true }, local: { autoReview: true } },
 			),
@@ -528,21 +585,6 @@ describe("Cursor SDK config resolver", () => {
 			runtime: "cloud",
 			cloud: { repo: "repo", environment: { name: "gpu" }, acknowledged: true },
 			local: { sandboxOptions: { enabled: true }, autoReview: true },
-		});
-	});
-
-	it("lets session runtime override config but not CLI or env", () => {
-		expect(resolveCursorSdkConfig({ session: { runtime: "cloud" }, project: { runtime: "local" } }).runtime).toMatchObject({
-			value: "cloud",
-			source: "session",
-		});
-		expect(resolveCursorSdkConfig({ env: { [CURSOR_RUNTIME_ENV]: "local" }, session: { runtime: "cloud" } }).runtime).toMatchObject({
-			value: "local",
-			source: "environment",
-		});
-		expect(resolveCursorSdkConfig({ cli: { runtime: "local" }, session: { runtime: "cloud" } }).runtime).toMatchObject({
-			value: "local",
-			source: "cli",
 		});
 	});
 

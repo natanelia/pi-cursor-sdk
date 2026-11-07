@@ -10,8 +10,11 @@ import {
 	resetCursorProviderTestState,
 	mockCreatedAgent,
 } from "./helpers/cursor-provider-harness.js";
-import { streamCursor } from "../src/cursor-provider.js";
+import { streamCursor } from "./helpers/cursor-provider-ownership.js";
 import { __testUtils as cursorSdkProcessGuardTestUtils } from "../src/cursor-sdk-process-error-guard.js";
+
+const emitProcessEvent = (event: string | symbol, ...args: unknown[]): boolean =>
+	(process.emit as (event: string | symbol, ...args: unknown[]) => boolean).call(process, event, ...args);
 
 function trackUnhandledRejections(): { rejections: unknown[]; restore: () => void } {
 	const rejections: unknown[] = [];
@@ -100,7 +103,6 @@ describe("streamCursor connect timeout boundary", () => {
 			expect(error.reason).toBe("error");
 			expect(error.error.errorMessage).toContain("Network error");
 			expect(error.error.errorMessage).toContain("failed during network or service I/O");
-			expect(error.error.errorMessage).toContain("pi will retry automatically");
 			expect(rejections).toEqual([]);
 		} finally {
 			restore();
@@ -138,7 +140,7 @@ describe("streamCursor connect timeout boundary", () => {
 		}
 	});
 
-	it("suppresses duplicate process-level generic connect-node network ConnectError during an active provider turn", async () => {
+	it("propagates an unrelated connect-node ECONNRESET during an actual active Cursor provider turn", async () => {
 		const connectError = makeGenericConnectNodeNetworkConnectError();
 		let processListenerCalled = false;
 		const processListener = () => {
@@ -150,7 +152,8 @@ describe("streamCursor connect timeout boundary", () => {
 			agentId: "agent-1",
 			status: "running",
 			wait: vi.fn().mockImplementation(async () => {
-				process.emit("uncaughtException", connectError, "uncaughtException");
+				expect(cursorSdkProcessGuardTestUtils.activeProviderTurnCount()).toBeGreaterThan(0);
+				emitProcessEvent("uncaughtException", connectError, "uncaughtException");
 				throw connectError;
 			}),
 			cancel: vi.fn(),
@@ -167,8 +170,7 @@ describe("streamCursor connect timeout boundary", () => {
 			expect(errors[0].reason).toBe("error");
 			expect(errors[0].error.errorMessage).toContain("Network error");
 			expect(errors[0].error.errorMessage).toContain("failed during network or service I/O");
-			expect(errors[0].error.errorMessage).toContain("pi will retry automatically");
-			expect(processListenerCalled).toBe(false);
+			expect(processListenerCalled).toBe(true);
 			expect(cursorSdkProcessGuardTestUtils.activeProviderTurnCount()).toBe(0);
 		} finally {
 			process.removeListener("uncaughtException", processListener);
@@ -187,7 +189,7 @@ describe("streamCursor connect timeout boundary", () => {
 			agentId: "agent-1",
 			status: "running",
 			wait: vi.fn().mockImplementation(async () => {
-				process.emit("uncaughtException", connectError, "uncaughtException");
+				emitProcessEvent("uncaughtException", connectError, "uncaughtException");
 				throw connectError;
 			}),
 			cancel: vi.fn(),
@@ -204,7 +206,6 @@ describe("streamCursor connect timeout boundary", () => {
 			expect(errors[0].reason).toBe("error");
 			expect(errors[0].error.errorMessage).toContain("Network error");
 			expect(errors[0].error.errorMessage).toContain("failed during network or service I/O");
-			expect(errors[0].error.errorMessage).toContain("pi will retry automatically");
 			expect(processListenerCalled).toBe(false);
 			expect(cursorSdkProcessGuardTestUtils.activeProviderTurnCount()).toBe(0);
 		} finally {

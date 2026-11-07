@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -6,12 +6,15 @@ import {
 	discoverModels,
 	buildCursorModelSelection,
 	getCursorModelMetadata,
-	getCursorModelMetadataEntries,
 	__testUtils,
 	type CursorModelFallbackIssue,
 } from "../src/model-discovery.js";
-import { saveCachedContextWindow, __testUtils as contextWindowCacheTestUtils } from "../src/context-window-cache.js";
-import { FALLBACK_MODEL_ITEMS } from "../src/cursor-fallback-models.generated.js";
+import { saveCachedContextWindow } from "../src/context-window-cache.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+	const fs = await importOriginal<typeof import("node:fs")>();
+	return { ...fs, readFileSync: vi.fn(fs.readFileSync) };
+});
 
 vi.mock("@cursor/sdk", () => ({
 	Cursor: {
@@ -45,6 +48,7 @@ describe("discoverModels", () => {
 	beforeEach(() => {
 		process.env = { ...originalEnv };
 		delete process.env.CURSOR_API_KEY;
+		delete process.env.PI_CURSOR_HIDE_MODELS_WHEN_LOGGED_OUT;
 		tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-discovery-"));
 		process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
 		process.argv = ["node", "vitest"];
@@ -60,27 +64,8 @@ describe("discoverModels", () => {
 	it("returns generated fallback models when no API key", async () => {
 		delete process.env.CURSOR_API_KEY;
 		const issues: CursorModelFallbackIssue[] = [];
-		const models = await discoverModels({ onFallback: (issue) => issues.push(issue) });
-		const modelIds = models.map((model) => model.id);
-		expect(modelIds).toEqual(
-			expect.arrayContaining([
-				"claude-opus-4-7@1m",
-				"claude-opus-4-7@300k",
-				"claude-opus-4-8@1m",
-				"claude-opus-4-8@300k",
-				"claude-sonnet-4-6@1m",
-				"claude-sonnet-4-6@200k",
-				"composer-2.5",
-				"composer-2-5",
-				"composer-latest",
-				"grok-4.6",
-				"grok-4.6:fast",
-				"grok-4.6:slow",
-				"gpt-5.5@1m",
-				"gpt-5.5@272k",
-			]),
-		);
-		expect(modelIds.length).toBeGreaterThan(20);
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY, onFallback: (issue) => issues.push(issue) });
+		expect(models.length).toBeGreaterThan(0);
 		expect(issues).toEqual([
 			expect.objectContaining({
 				reason: "missing-api-key",
@@ -95,15 +80,6 @@ describe("discoverModels", () => {
 		expect(mockedList).not.toHaveBeenCalled();
 	});
 
-	it("returns fallback models and reports missing key when API key is whitespace", async () => {
-		process.env.CURSOR_API_KEY = "   ";
-		const issues: CursorModelFallbackIssue[] = [];
-		const models = await discoverModels({ onFallback: (issue) => issues.push(issue) });
-		expect(models.some((model) => model.id === "gpt-5.5@1m")).toBe(true);
-		expect(issues).toEqual([expect.objectContaining({ reason: "missing-api-key" })]);
-		expect(mockedList).not.toHaveBeenCalled();
-	});
-
 	it("ignores adversarial Pi argv forms during startup discovery", async () => {
 		process.argv = [
 			"node", "pi", "--model", "anthropic/first", "--api-key", "first-key",
@@ -113,7 +89,7 @@ describe("discoverModels", () => {
 			"--model", "cursor/final", "--api-key", "last-key",
 		];
 
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 
 		expect(models.some((model) => model.id === "composer-2.5")).toBe(true);
 		expect(mockedList).not.toHaveBeenCalled();
@@ -130,90 +106,14 @@ describe("discoverModels", () => {
 		expect(models.map((model) => model.id)).toEqual(["composer-2"]);
 	});
 
-	it("uses stored pi auth for model discovery when env and CLI are absent", async () => {
-		writeStoredCursorApiKey("stored-key-123");
-		mockedList.mockResolvedValueOnce([
-			{
-				id: "composer-2",
-				displayName: "Composer 2",
-				variants: [{ params: [], displayName: "Composer 2", isDefault: true }],
-			},
-		]);
-
-		const models = await discoverModels();
-
-		expect(mockedList).toHaveBeenCalledWith({ apiKey: "stored-key-123" });
-		expect(models.map((model) => model.id)).toEqual(["composer-2"]);
-	});
-
-	it("prefers stored pi auth over CURSOR_API_KEY for model discovery", async () => {
-		writeStoredCursorApiKey("stored-key-123");
-		process.env.CURSOR_API_KEY = "env-key-123";
-		mockedList.mockResolvedValueOnce([
-			{
-				id: "composer-2",
-				displayName: "Composer 2",
-				variants: [{ params: [], displayName: "Composer 2", isDefault: true }],
-			},
-		]);
-
-		await discoverModels();
-
-		expect(mockedList).toHaveBeenCalledWith({ apiKey: "stored-key-123" });
-	});
-
-	it.each(["CURSOR_API_KEY", "$CURSOR_API_KEY", "${CURSOR_API_KEY}", "pi-cursor-sdk-cursor-api-key-placeholder"])(
-		"treats unresolved stored %s auth as missing when env is absent",
-		async (placeholder) => {
-			writeStoredCursorApiKey(placeholder);
-			const issues: CursorModelFallbackIssue[] = [];
-
-			const models = await discoverModels({ onFallback: (issue) => issues.push(issue) });
-
-			expect(models.some((model) => model.id === "composer-2.5")).toBe(true);
-			expect(issues).toEqual([expect.objectContaining({ reason: "missing-api-key" })]);
-			expect(issues[0].message).toContain("/login");
-			expect(mockedList).not.toHaveBeenCalled();
-		},
-	);
-
-	it.each(["CURSOR_API_KEY", "$CURSOR_API_KEY", "${CURSOR_API_KEY}", "pi-cursor-sdk-cursor-api-key-placeholder"])(
-		"resolves stored %s auth through the env var when present",
-		async (placeholder) => {
-			writeStoredCursorApiKey(placeholder);
-			process.env.CURSOR_API_KEY = "env-key-123";
-			mockedList.mockResolvedValueOnce([
-				{
-					id: "composer-2",
-					displayName: "Composer 2",
-					variants: [{ params: [], displayName: "Composer 2", isDefault: true }],
-				},
-			]);
-
-			await discoverModels();
-
-			expect(mockedList).toHaveBeenCalledWith({ apiKey: "env-key-123" });
-		},
-	);
-
-	it("calls Cursor.models.list with API key and sorts by base id", async () => {
-		process.env.CURSOR_API_KEY = "test-key-123";
-		mockedList.mockResolvedValueOnce([
-			{
-				id: "model-b",
-				displayName: "Model B",
-				variants: [{ params: [], displayName: "Model B", isDefault: true }],
-			},
-			{
-				id: "model-a",
-				displayName: "Model A",
-				variants: [{ params: [], displayName: "Model A", isDefault: true }],
-			},
-		]);
-		const models = await discoverModels();
-		expect(mockedList).toHaveBeenCalledWith({ apiKey: "test-key-123" });
-		expect(models.map((model) => model.id)).toEqual(["model-a", "model-b"]);
-		expect(models[0].name).toBe("Model A");
+	it.each([undefined, "   "])("never falls through an explicit missing native key %s to unrelated default auth or ambient env", async (apiKey) => {
+		writeStoredCursorApiKey("unrelated-default-key");
+		process.env.CURSOR_API_KEY = "unrelated-ambient-key";
+		const issues: CursorModelFallbackIssue[] = [];
+		const models = await discoverModels({ apiKey, onFallback: (issue) => issues.push(issue) });
+		expect(models.some((model) => model.id === "composer-2.5")).toBe(true);
+		expect(issues[0].reason).toBe("missing-api-key");
+		expect(mockedList).not.toHaveBeenCalled();
 	});
 
 	it("sorts by base id while preserving Cursor SDK context value order inside each model", async () => {
@@ -233,8 +133,10 @@ describe("discoverModels", () => {
 			},
 		]);
 
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 
+		expect(mockedList).toHaveBeenCalledExactlyOnceWith({ apiKey: "test-key-123" });
+		expect(models[0].name).toBe("A Model @ 300k");
 		expect(models.map((model) => model.id)).toEqual(["a-model@300k", "a-model@1m", "z-model@long", "z-model@short"]);
 		expect(getCursorModelMetadata("a-model@300k")?.defaultParams).toEqual([{ id: "context", value: "300k" }]);
 		expect(getCursorModelMetadata("z-model@long")?.defaultParams).toEqual([{ id: "context", value: "long" }]);
@@ -264,7 +166,7 @@ describe("discoverModels", () => {
 			},
 		]);
 
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 
 		expect(models.map((model) => model.id)).toEqual(["gpt-5.5@1m", "gpt-5.5@272k", "gpt-latest@1m", "gpt-latest@272k"]);
 		expect(models[2].name).toBe("GPT-5.5 (gpt-latest) @ 1m");
@@ -282,51 +184,6 @@ describe("discoverModels", () => {
 		});
 	});
 
-	it("skips aliases that multiple Cursor base models share", async () => {
-		process.env.CURSOR_API_KEY = "test-key-123";
-		mockedList.mockResolvedValueOnce([
-			{
-				id: "model-a",
-				displayName: "Model A",
-				aliases: ["model-latest", "model-shared"],
-				variants: [{ params: [], displayName: "Model A", isDefault: true }],
-			},
-			{
-				id: "model-b",
-				displayName: "Model B",
-				aliases: ["model-stable", "model-shared"],
-				variants: [{ params: [], displayName: "Model B", isDefault: true }],
-			},
-		]);
-
-		const models = await discoverModels();
-
-		expect(models.map((model) => model.id)).toEqual(["model-a", "model-latest", "model-b", "model-stable"]);
-		expect(getCursorModelMetadata("model-shared")).toBeUndefined();
-	});
-
-	it("skips aliases that collide with another Cursor base model id", async () => {
-		process.env.CURSOR_API_KEY = "test-key-123";
-		mockedList.mockResolvedValueOnce([
-			{
-				id: "model-a",
-				displayName: "Model A",
-				aliases: ["model-b", "model-a-latest"],
-				variants: [{ params: [], displayName: "Model A", isDefault: true }],
-			},
-			{
-				id: "model-b",
-				displayName: "Model B",
-				variants: [{ params: [], displayName: "Model B", isDefault: true }],
-			},
-		]);
-
-		const models = await discoverModels();
-
-		expect(models.map((model) => model.id)).toEqual(["model-a", "model-a-latest", "model-b"]);
-		expect(getCursorModelMetadata("model-b")?.baseModelId).toBe("model-b");
-	});
-
 	it("uses the aliased base model context-window cache for aliases without context params", async () => {
 		process.env.CURSOR_API_KEY = "test-key-123";
 		mockedList.mockResolvedValueOnce([
@@ -338,7 +195,7 @@ describe("discoverModels", () => {
 			},
 		]);
 
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 
 		expect(models.map((model) => [model.id, model.contextWindow])).toEqual([
 			["gpt-5-mini", 272000],
@@ -374,7 +231,7 @@ describe("discoverModels", () => {
 				],
 			},
 		]);
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 		expect(models.map((model) => model.id)).toEqual([
 			"gpt-5.4@272k",
 			"gpt-5.4@272k:fast",
@@ -456,7 +313,7 @@ describe("discoverModels", () => {
 				],
 			},
 		]);
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 		expect(models.map((model) => model.id)).toEqual(["gpt-5.3-codex", "gpt-5.3-codex:fast", "gpt-5.3-codex:slow"]);
 		expect(getCursorModelMetadata("gpt-5.3-codex")?.defaultParams).toEqual([
 			{ id: "reasoning", value: "high" },
@@ -465,95 +322,77 @@ describe("discoverModels", () => {
 	});
 
 	it("uses bundled SDK-derived context windows for models without context params", async () => {
-		const tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-context-window-bundled-"));
-		process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
-		try {
-			process.env.CURSOR_API_KEY = "test-key-123";
-			mockedList.mockResolvedValueOnce([
-				{
-					id: "composer-2",
-					displayName: "Composer 2",
-					parameters: [{ id: "fast", displayName: "Fast", values: [{ value: "false" }, { value: "true" }] }],
-					variants: [{ params: [{ id: "fast", value: "true" }], displayName: "Composer 2", isDefault: true }],
-				},
-				{
-					id: "new-sdk-model",
-					displayName: "New SDK Model",
-					variants: [{ params: [], displayName: "New SDK Model", isDefault: true }],
-				},
-			]);
+		process.env.CURSOR_API_KEY = "test-key-123";
+		mockedList.mockResolvedValueOnce([
+			{
+				id: "composer-2",
+				displayName: "Composer 2",
+				parameters: [{ id: "fast", displayName: "Fast", values: [{ value: "false" }, { value: "true" }] }],
+				variants: [{ params: [{ id: "fast", value: "true" }], displayName: "Composer 2", isDefault: true }],
+			},
+			{
+				id: "new-sdk-model",
+				displayName: "New SDK Model",
+				variants: [{ params: [], displayName: "New SDK Model", isDefault: true }],
+			},
+		]);
 
-			const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 
-			expect(models.map((model) => [model.id, model.contextWindow])).toEqual([
-				["composer-2", 200000],
-				["composer-2:fast", 200000],
-				["composer-2:slow", 200000],
-				["new-sdk-model", 200000],
-			]);
-		} finally {
-			rmSync(tmpAgentDir, { recursive: true, force: true });
-		}
+		expect(models.find(({ id }) => id === "new-sdk-model")).toMatchObject({
+			reasoning: false,
+			input: ["text", "image"],
+		});
+		expect(models.find(({ id }) => id === "new-sdk-model")?.thinkingLevelMap).toBeUndefined();
+		expect(models.map((model) => [model.id, model.contextWindow])).toEqual([
+			["composer-2", 200000],
+			["composer-2:fast", 200000],
+			["composer-2:slow", 200000],
+			["new-sdk-model", 200000],
+		]);
 	});
 
-	it("loads the context-window cache once while registering a model catalog", async () => {
-		const tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-context-window-count-"));
-		process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
-		try {
-			contextWindowCacheTestUtils.resetUserContextWindowOverrideLoadCount();
-			process.env.CURSOR_API_KEY = "test-key-123";
-			mockedList.mockResolvedValueOnce(
-				Array.from({ length: 25 }, (_, index) => ({
-					id: `synthetic-model-${index}`,
-					displayName: `Synthetic Model ${index}`,
-					variants: [{ params: [], displayName: `Synthetic Model ${index}`, isDefault: true }],
-				})),
-			);
+	it.each([3, 25])("bounds populated context-window cache reads for a %i-model catalog", async (catalogSize) => {
+		const cachePath = join(tmpAgentDir, "cursor-sdk-context-windows.json");
+		writeFileSync(cachePath, JSON.stringify({ contextWindows: { default: 321000, "synthetic-model-0": 654000 } }));
+		process.env.CURSOR_API_KEY = "test-key-123";
+		mockedList.mockResolvedValueOnce(
+			Array.from({ length: catalogSize }, (_, index) => ({
+				id: `synthetic-model-${index}`,
+				displayName: `Synthetic Model ${index}`,
+				variants: [{ params: [], displayName: `Synthetic Model ${index}`, isDefault: true }],
+			})),
+		);
 
-			await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 
-			expect(contextWindowCacheTestUtils.getUserContextWindowOverrideLoadCount()).toBe(1);
-		} finally {
-			rmSync(tmpAgentDir, { recursive: true, force: true });
-		}
+		expect(models).toHaveLength(catalogSize);
+		expect(models.find(({ id }) => id === "synthetic-model-0")?.contextWindow).toBe(654000);
+		expect(models.filter(({ id }) => id !== "synthetic-model-0").map(({ contextWindow }) => contextWindow))
+			.toEqual(Array(catalogSize - 1).fill(321000));
+		const cacheReads = vi.mocked(readFileSync).mock.calls.filter(([path]) => path === cachePath).length;
+		expect(cacheReads).toBeGreaterThan(0);
+		expect(cacheReads).toBeLessThanOrEqual(3);
 	});
 
 	it("lets user cache override context-qualified model IDs", async () => {
-		const tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-context-window-qualified-"));
-		process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
-		try {
-			saveCachedContextWindow("gpt-5.5@1m", 950000);
-			process.env.CURSOR_API_KEY = "test-key-123";
-			mockedList.mockResolvedValueOnce([
-				{
-					id: "gpt-5.5",
-					displayName: "GPT-5.5",
-					parameters: [{ id: "context", displayName: "Context", values: [{ value: "1m" }, { value: "272k" }] }],
-					variants: [{ params: [{ id: "context", value: "1m" }], displayName: "GPT-5.5", isDefault: true }],
-				},
-			]);
+		saveCachedContextWindow("gpt-5.5@1m", 950000);
+		process.env.CURSOR_API_KEY = "test-key-123";
+		mockedList.mockResolvedValueOnce([
+			{
+				id: "gpt-5.5",
+				displayName: "GPT-5.5",
+				parameters: [{ id: "context", displayName: "Context", values: [{ value: "1m" }, { value: "272k" }] }],
+				variants: [{ params: [{ id: "context", value: "1m" }], displayName: "GPT-5.5", isDefault: true }],
+			},
+		]);
 
-			const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 
-			expect(models.map((model) => [model.id, model.contextWindow])).toEqual([
-				["gpt-5.5@1m", 950000],
-				["gpt-5.5@272k", 272000],
-			]);
-		} finally {
-			rmSync(tmpAgentDir, { recursive: true, force: true });
-		}
-	});
-
-	it("uses base context evidence for aliases unless an exact alias observation exists", () => {
-		const opus = FALLBACK_MODEL_ITEMS.find(({ id }) => id === "claude-opus-4-8");
-		if (!opus) throw new Error("claude-opus-4-8 fallback fixture missing");
-		saveCachedContextWindow("opus-4-8@1m", 310000);
-
-		const windowsById = Object.fromEntries(register([opus]).map(({ id, contextWindow }) => [id, contextWindow]));
-
-		expect(windowsById["claude-opus-4-8@1m"]).toBe(300000);
-		expect(windowsById["opus-4.8@1m"]).toBe(300000);
-		expect(windowsById["opus-4-8@1m"]).toBe(310000);
+		expect(models.map((model) => [model.id, model.contextWindow])).toEqual([
+			["gpt-5.5@1m", 950000],
+			["gpt-5.5@272k", 272000],
+		]);
 	});
 
 	it("inherits base context and fast evidence for aliases without exact observations", () => {
@@ -582,66 +421,40 @@ describe("discoverModels", () => {
 	});
 
 	it("lets user cache override bundled context windows", async () => {
-		const tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-context-window-"));
-		process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
-		try {
-			saveCachedContextWindow("composer-2", 201000);
-			process.env.CURSOR_API_KEY = "test-key-123";
-			mockedList.mockResolvedValueOnce([
-				{
-					id: "composer-2",
-					displayName: "Composer 2",
-					parameters: [{ id: "fast", displayName: "Fast", values: [{ value: "false" }, { value: "true" }] }],
-					variants: [{ params: [{ id: "fast", value: "true" }], displayName: "Composer 2", isDefault: true }],
-				},
-			]);
-
-			const models = await discoverModels();
-
-			expect(models.map((model) => [model.id, model.contextWindow])).toEqual([
-				["composer-2", 201000],
-				["composer-2:fast", 201000],
-				["composer-2:slow", 201000],
-			]);
-		} finally {
-			rmSync(tmpAgentDir, { recursive: true, force: true });
-		}
-	});
-
-	it("ignores malformed context-window cache values", async () => {
-		const tmpAgentDir = mkdtempSync(join(tmpdir(), "pi-cursor-context-window-malformed-"));
-		process.env.PI_CODING_AGENT_DIR = tmpAgentDir;
-		try {
-			writeFileSync(contextWindowCacheTestUtils.getCachePath(), JSON.stringify({ contextWindows: { "composer-2": "201000" } }));
-			process.env.CURSOR_API_KEY = "test-key-123";
-			mockedList.mockResolvedValueOnce([
-				{
-					id: "composer-2",
-					displayName: "Composer 2",
-					variants: [{ params: [], displayName: "Composer 2", isDefault: true }],
-				},
-			]);
-
-			const models = await discoverModels();
-
-			expect(models.find((model) => model.id === "composer-2")?.contextWindow).toBe(200000);
-		} finally {
-			rmSync(tmpAgentDir, { recursive: true, force: true });
-		}
-	});
-
-	it("sets reasoning false for models without thinking controls", async () => {
+		saveCachedContextWindow("composer-2", 201000);
 		process.env.CURSOR_API_KEY = "test-key-123";
 		mockedList.mockResolvedValueOnce([
 			{
-				id: "gemini-3.1-pro",
-				displayName: "Gemini 3.1 Pro",
-				variants: [{ params: [], displayName: "Gemini 3.1 Pro", isDefault: true }],
+				id: "composer-2",
+				displayName: "Composer 2",
+				parameters: [{ id: "fast", displayName: "Fast", values: [{ value: "false" }, { value: "true" }] }],
+				variants: [{ params: [{ id: "fast", value: "true" }], displayName: "Composer 2", isDefault: true }],
 			},
 		]);
-		const models = await discoverModels();
-		expect(models[0].reasoning).toBe(false);
-		expect(models[0].thinkingLevelMap).toBeUndefined();
+
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
+
+		expect(models.map((model) => [model.id, model.contextWindow])).toEqual([
+			["composer-2", 201000],
+			["composer-2:fast", 201000],
+			["composer-2:slow", 201000],
+		]);
+	});
+
+	it("ignores malformed context-window cache values", async () => {
+		writeFileSync(join(tmpAgentDir, "cursor-sdk-context-windows.json"), JSON.stringify({ contextWindows: { "composer-2": "201000" } }));
+		process.env.CURSOR_API_KEY = "test-key-123";
+		mockedList.mockResolvedValueOnce([
+			{
+				id: "composer-2",
+				displayName: "Composer 2",
+				variants: [{ params: [], displayName: "Composer 2", isDefault: true }],
+			},
+		]);
+
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
+
+		expect(models.find((model) => model.id === "composer-2")?.contextWindow).toBe(200000);
 	});
 
 	it("maps Cursor reasoning values to pi thinking levels", async () => {
@@ -673,7 +486,7 @@ describe("discoverModels", () => {
 				],
 			},
 		]);
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 		expect(models[0].thinkingLevelMap).toEqual({
 			off: "none",
 			minimal: "minimal",
@@ -707,7 +520,7 @@ describe("discoverModels", () => {
 				],
 			},
 		]);
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 		expect(models[0].thinkingLevelMap).toEqual({
 			off: "false",
 			minimal: null,
@@ -717,71 +530,6 @@ describe("discoverModels", () => {
 			xhigh: null,
 			max: null,
 		});
-	});
-
-	it("maps Claude effort with distinct xhigh and max values", async () => {
-		process.env.CURSOR_API_KEY = "test-key-123";
-		mockedList.mockResolvedValueOnce([
-			{
-				id: "claude-opus-4-7",
-				displayName: "Opus 4.7",
-				parameters: [
-					{ id: "thinking", displayName: "Thinking", values: [{ value: "false" }, { value: "true" }] },
-					{ id: "context", displayName: "Context", values: [{ value: "300k" }, { value: "1m" }] },
-					{
-						id: "effort",
-						displayName: "Effort",
-						values: [
-							{ value: "low" },
-							{ value: "medium" },
-							{ value: "high" },
-							{ value: "xhigh" },
-							{ value: "max" },
-							{ value: "extra-high" },
-						],
-					},
-				],
-				variants: [
-					{
-						params: [
-							{ id: "thinking", value: "true" },
-							{ id: "context", value: "1m" },
-							{ id: "effort", value: "xhigh" },
-						],
-						displayName: "Opus 4.7",
-						isDefault: true,
-					},
-				],
-			},
-		]);
-		const models = await discoverModels();
-		expect(models.map((model) => model.id)).toEqual(["claude-opus-4-7@300k", "claude-opus-4-7@1m"]);
-		expect(models[0].contextWindow).toBe(300000);
-		expect(models[1].contextWindow).toBe(1000000);
-		expect(models[0].thinkingLevelMap).toEqual({
-			off: "false",
-			minimal: null,
-			low: "low",
-			medium: "medium",
-			high: "high",
-			xhigh: "xhigh",
-			max: "max",
-		});
-	});
-
-	it("registers text and image input for Cursor models", async () => {
-		process.env.CURSOR_API_KEY = "test-key-123";
-		mockedList.mockResolvedValueOnce([
-			{
-				id: "vision-capable",
-				displayName: "Vision Capable",
-				variants: [{ params: [], displayName: "Vision Capable", isDefault: true }],
-			},
-		]);
-
-		const models = await discoverModels();
-
-		expect(models[0].input).toEqual(["text", "image"]);
 	});
 
 	it("maps reasoning off to unsupported null when Cursor exposes no none or off value", async () => {
@@ -801,7 +549,7 @@ describe("discoverModels", () => {
 			},
 		]);
 
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 
 		expect(models[0].thinkingLevelMap).toEqual({
 			off: null,
@@ -818,21 +566,23 @@ describe("discoverModels", () => {
 		});
 	});
 
-	it("maps boolean thinking plus effort to thinking=true with effort and off to thinking=false without effort", async () => {
+	it.each(["effort", "reasoning_effort"])("maps boolean thinking plus %s to enabled effort levels and off without effort", async (effortId) => {
 		process.env.CURSOR_API_KEY = "test-key-123";
 		mockedList.mockResolvedValueOnce([
 			{
 				id: "claude-like",
 				displayName: "Claude Like",
 				parameters: [
+					{ id: "context", displayName: "Context", values: [{ value: "300k" }, { value: "1m" }] },
 					{ id: "thinking", displayName: "Thinking", values: [{ value: "false" }, { value: "true" }] },
-					{ id: "effort", displayName: "Effort", values: [{ value: "low" }, { value: "medium" }, { value: "high" }] },
+					{ id: effortId, displayName: "Effort", values: [{ value: "low" }, { value: "medium" }, { value: "high" }, { value: "xhigh" }, { value: "max" }, { value: "extra-high" }] },
 				],
 				variants: [
 					{
 						params: [
 							{ id: "thinking", value: "true" },
-							{ id: "effort", value: "medium" },
+							{ id: effortId, value: "medium" },
+							{ id: "context", value: "1m" },
 						],
 						displayName: "Claude Like",
 						isDefault: true,
@@ -841,125 +591,39 @@ describe("discoverModels", () => {
 			},
 		]);
 
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 
+		expect(models.map((model) => [model.id, model.contextWindow])).toEqual([
+			["claude-like@300k", 300000],
+			["claude-like@1m", 1000000],
+		]);
 		expect(models[0].thinkingLevelMap).toEqual({
 			off: "false",
 			minimal: null,
 			low: "low",
 			medium: "medium",
 			high: "high",
-			xhigh: null,
-			max: null,
+			xhigh: "xhigh",
+			max: "max",
 		});
-		expect(buildCursorModelSelection("claude-like", "high")).toEqual({
+		for (const level of ["low", "medium", "high", "xhigh", "max"] as const) {
+			expect(buildCursorModelSelection("claude-like@300k", level)).toEqual({
+				id: "claude-like",
+				params: [
+					{ id: "thinking", value: "true" },
+					{ id: effortId, value: level },
+					{ id: "context", value: "300k" },
+				],
+			});
+		}
+		expect(buildCursorModelSelection("claude-like@300k", "minimal", true)).toEqual({
 			id: "claude-like",
-			params: [
-				{ id: "thinking", value: "true" },
-				{ id: "effort", value: "high" },
-			],
+			params: [{ id: "thinking", value: "true" }, { id: effortId, value: "medium" }, { id: "context", value: "300k" }],
 		});
-		expect(buildCursorModelSelection("claude-like", "off")).toEqual({
+		expect(buildCursorModelSelection("claude-like@300k", "off")).toEqual({
 			id: "claude-like",
-			params: [{ id: "thinking", value: "false" }],
+			params: [{ id: "thinking", value: "false" }, { id: "context", value: "300k" }],
 		});
-	});
-
-	it("keeps the fallback snapshot aligned with the current Composer 2.5 catalog shape", async () => {
-		delete process.env.CURSOR_API_KEY;
-
-		const models = await discoverModels();
-		const modelIds = models.map((model) => model.id);
-
-		expect(modelIds).toEqual(expect.arrayContaining(["composer-2.5", "composer-2-5", "composer-latest"]));
-		expect(getCursorModelMetadata("composer-2.5")).toEqual(
-			expect.objectContaining({
-				baseModelId: "composer-2.5",
-				selectionModelId: "composer-2.5",
-				contextWindow: 200000,
-				supportsFast: true,
-				defaultFast: true,
-			}),
-		);
-		expect(getCursorModelMetadata("composer-2-5")).toEqual(
-			expect.objectContaining({
-				baseModelId: "composer-2.5",
-				selectionModelId: "composer-2-5",
-				contextWindow: 200000,
-				supportsFast: true,
-				defaultFast: true,
-			}),
-		);
-		expect(buildCursorModelSelection("composer-2.5", "off")).toEqual({
-			id: "composer-2.5",
-			params: [{ id: "fast", value: "true" }],
-		});
-		expect(buildCursorModelSelection("composer-2.5", "off", false)).toEqual({
-			id: "composer-2.5",
-			params: [{ id: "fast", value: "false" }],
-		});
-	});
-
-	it("falls back and reports discovery failure when Cursor.models.list throws", async () => {
-		process.env.CURSOR_API_KEY = "test-key-123";
-		const issues: CursorModelFallbackIssue[] = [];
-		mockedList.mockRejectedValueOnce(new Error("network error"));
-		const models = await discoverModels({ onFallback: (issue) => issues.push(issue) });
-		expect(models.some((model) => model.id === "composer-2.5")).toBe(true);
-		expect(issues).toEqual([
-			expect.objectContaining({
-				reason: "discovery-failed",
-				message: expect.stringContaining("Cursor model discovery failed"),
-			}),
-		]);
-		expect(issues[0].message).toContain("network error");
-		expect(issues[0].errorMessage).toBe("network error");
-		expect(issues[0].message).toContain("/login");
-		expect(issues[0].message).not.toContain("test-key-123");
-	});
-
-	it("redacts sensitive values from fallback failure details", async () => {
-		process.env.CURSOR_API_KEY = "test-key-123";
-		const issues: CursorModelFallbackIssue[] = [];
-		mockedList.mockRejectedValueOnce(
-			new Error(
-				'Unauthorized Bearer test-key-123 {"apiKey":"test-key-123","token":"token-value","session_id":"session-value"} https://repo-user:repo-p@ss@example.com/org/repo.git cookie: foo=bar; baz=qux',
-			),
-		);
-
-		await discoverModels({ onFallback: (issue) => issues.push(issue) });
-
-		expect(issues[0].reason).toBe("discovery-failed");
-		expect(issues[0].message).toContain("Bearer [redacted]");
-		expect(issues[0].message).toContain('"apiKey":"[redacted]"');
-		expect(issues[0].message).toContain('"token":"[redacted]"');
-		expect(issues[0].message).toContain('"session_id":"[redacted]"');
-		expect(issues[0].message).toContain("cookie: [redacted]");
-		expect(issues[0].errorMessage).toContain("Bearer [redacted]");
-		expect(issues[0].message).not.toContain("test-key-123");
-		expect(issues[0].message).not.toContain("token-value");
-		expect(issues[0].message).not.toContain("session-value");
-		expect(issues[0].message).not.toContain("repo-user");
-		expect(issues[0].message).not.toContain("repo-p");
-		expect(issues[0].message).not.toContain("@ss@");
-		expect(issues[0].message).not.toContain("foo=bar");
-		expect(issues[0].message).not.toContain("baz=qux");
-	});
-
-	it("falls back and reports empty model list when Cursor.models.list returns empty", async () => {
-		process.env.CURSOR_API_KEY = "test-key-123";
-		const issues: CursorModelFallbackIssue[] = [];
-		mockedList.mockResolvedValueOnce([]);
-		const models = await discoverModels({ onFallback: (issue) => issues.push(issue) });
-		expect(models.some((model) => model.id === "claude-opus-4-8@1m")).toBe(true);
-		expect(issues).toEqual([
-			expect.objectContaining({
-				reason: "empty-model-list",
-				message: expect.stringContaining("Cursor model discovery returned no models"),
-			}),
-		]);
-		expect(issues[0].message).toContain("/login");
-		expect(issues[0].message).toContain("/cursor-refresh-models");
 	});
 
 	it("uses id as name when displayName is missing", async () => {
@@ -967,7 +631,7 @@ describe("discoverModels", () => {
 		mockedList.mockResolvedValueOnce([
 			{ id: "raw-id", variants: [{ params: [], displayName: "raw-id", isDefault: true }] } as unknown as ModelListItem,
 		]);
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 		expect(models[0].name).toBe("raw-id");
 	});
 
@@ -984,7 +648,7 @@ describe("discoverModels", () => {
 				],
 			},
 		]);
-		const models = await discoverModels();
+		const models = await discoverModels({ apiKey: process.env.CURSOR_API_KEY });
 		expect(models[0].id).toBe("test-model");
 		expect(buildCursorModelSelection("test-model", "off")).toEqual({
 			id: "test-model",

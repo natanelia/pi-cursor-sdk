@@ -1,10 +1,12 @@
+// Install the external SDK transport mock before the static provider dependency graph evaluates.
+import "./helpers/cursor-provider-harness.js";
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SendOptions } from "@cursor/sdk";
 import { AssistantMessageComponent, initTheme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { CLOUD_AGENT_ID_PATTERN } from "../shared/cursor-cloud-lifecycle-constants.mjs";
-import { streamCursor } from "../src/cursor-provider.js";
+import { streamCursor } from "./helpers/cursor-provider-ownership.js";
 import {
 	asMockCursorRun,
 	collectEvents,
@@ -21,9 +23,6 @@ import {
 	registerBridgeForProviderTest,
 	resetCursorProviderTestState,
 } from "./helpers/cursor-provider-harness.js";
-import { readInstalledPackageVersion } from "./helpers/installed-package.js";
-
-const installedSdkVersion = readInstalledPackageVersion("@cursor/sdk");
 const CLOUD_RUN_ID_PATTERN = /^run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const RENDER_WIDTH = 80;
 
@@ -68,7 +67,6 @@ describe("cloud provider captured activity callbacks", () => {
 
 	it("routes normalized captured onDelta/onStep activity through the cloud coordinator without local replay or bridge leakage", async () => {
 		expect(fixture.sdkVersion).toBe("1.0.23");
-		expect(installedSdkVersion).toBe("1.0.27");
 		expect(fixture.sourceCapture.agentId).toMatch(CLOUD_AGENT_ID_PATTERN);
 		expect(fixture.sourceCapture.runId).toMatch(CLOUD_RUN_ID_PATTERN);
 		expect(fixture.sourceCapture.terminalStatus).toBe("finished");

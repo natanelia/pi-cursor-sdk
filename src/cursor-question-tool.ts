@@ -1,3 +1,4 @@
+import { isCursorLeanEnabled } from "./cursor-lean.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -11,7 +12,7 @@ export const CURSOR_ASK_QUESTION_TOOL_NAME = "cursor_ask_question";
 export const CURSOR_ASK_QUESTION_ENV = "PI_CURSOR_ASK_QUESTION";
 
 export function resolveCursorAskQuestionEnabled(env: Record<string, string | undefined> = process.env): boolean {
-	return parseEnvBoolean(env[CURSOR_ASK_QUESTION_ENV], true);
+	return parseEnvBoolean(env[CURSOR_ASK_QUESTION_ENV], false);
 }
 
 /** Package-namespaced event while `cursor_ask_question` awaits pi UI input. */
@@ -190,6 +191,7 @@ async function askOneQuestion(question: CursorQuestion, ctx: { ui: ExtensionCont
 }
 
 function syncCursorQuestionToolForModel(pi: Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">, model: ExtensionContext["model"]): void {
+	if (isCursorLeanEnabled()) return;
 	const activeToolNames = new Set(pi.getActiveTools());
 	const shouldBeActive = !arePiToolsDisabled(pi) && isCursorModel(model) && resolveCursorPiToolBridgeEnabled();
 	const alreadyActive = activeToolNames.has(CURSOR_ASK_QUESTION_TOOL_NAME);
@@ -210,19 +212,19 @@ function emitCursorAskQuestionBlockedEvent(
 }
 
 export function registerCursorQuestionTool(pi: CursorQuestionToolExtensionApi): void {
-	if (!resolveCursorAskQuestionEnabled()) return;
+	if (isCursorLeanEnabled() || !resolveCursorAskQuestionEnabled()) return;
 
 	pi.registerTool({
 		name: CURSOR_ASK_QUESTION_TOOL_NAME,
 		label: "Cursor question",
 		description:
-			"Ask the user a clarifying question from Cursor. Use when user preferences materially affect the next step; provide options when possible.",
-		promptSnippet: "Ask the user a clarifying question through pi UI when material choices affect Cursor's next step",
+			"Ask the user a clarifying question through pi UI. Do not use this unless the user asked to be prompted; otherwise proceed with a stated assumption.",
+		promptSnippet: "Do not prompt the user through cursor_ask_question unless they asked to be asked",
 		executionMode: "sequential",
 		parameters: CursorAskQuestionParamsSchema,
 		promptGuidelines: [
-			"Use cursor_ask_question only when running a Cursor model and user input would materially change the plan, scope, platform, or implementation path.",
-			"Prefer cursor_ask_question with 2-4 concrete options instead of guessing when Cursor plan mode needs user choices.",
+			"Do not call cursor_ask_question unless the user explicitly asked to be prompted or to choose among options.",
+			"If this tool is available, prefer a reasonable default and state the assumption instead of blocking on a questionnaire.",
 		],
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const questions = normalizeQuestions(params as CursorAskQuestionParams);

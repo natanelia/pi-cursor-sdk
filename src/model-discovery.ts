@@ -4,19 +4,21 @@ import type {
 	ModelParameterValue,
 	ModelSelection,
 } from "@cursor/sdk";
-import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ProviderModelConfig as PiProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { ModelThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { getCursorModelSelectionIdentities } from "../shared/cursor-model-selection-identities.mjs";
 import { loadContextWindowCache } from "./context-window-cache.js";
 import { loadCursorSdk } from "./cursor-sdk-runtime.js";
-import { resolveCursorApiKey, resolveCursorRuntimeApiKey } from "./cursor-api-key.js";
-import { scrubSensitiveText } from "./cursor-sensitive-text.js";
+import { normalizeCursorApiKey } from "./cursor-api-key.js";
+import { sanitizeCursorProviderError } from "./cursor-provider-errors.js";
 import {
 	fingerprintApiKey,
 	loadAnyCachedModelCatalog,
 	loadFreshCachedModels,
 	saveModelListCache,
 } from "./model-list-cache.js";
+
+type ProviderModelConfig = Extract<PiProviderModelConfig, { reasoning: boolean }>;
 
 const FALLBACK_CONTEXT_WINDOW = 128000;
 const FALLBACK_MAX_TOKENS = 16384;
@@ -26,7 +28,7 @@ const AUTH_SETUP_HINT = "/login (Use an API key -> Cursor) or CURSOR_API_KEY; st
 const CATALOG_REFRESH_HINT =
 	"After adding auth to an already-started pi session, run /cursor-refresh-models to refresh the full live Cursor model catalog without restarting pi.";
 
-export type CursorModelFallbackReason = "missing-api-key" | "discovery-failed" | "empty-model-list" | "cached-after-error";
+export type CursorModelFallbackReason = "missing-api-key" | "cache-only" | "discovery-failed" | "empty-model-list" | "cached-after-error";
 
 export interface CursorModelFallbackIssue {
 	reason: CursorModelFallbackReason;
@@ -37,14 +39,13 @@ export interface CursorModelFallbackIssue {
 export interface DiscoverModelsOptions {
 	onFallback?: (issue: CursorModelFallbackIssue) => void;
 	apiKey?: string;
-	// Bypass the on-disk model cache and always hit the live catalog. Used by the
-	// /cursor-refresh-models command; the startup path leaves this false so warm
-	// boots skip the slow network round-trip.
+	allowNetwork?: boolean;
+	signal?: AbortSignal;
+	/** Native publication owns models, metadata, cache and warning changes together. */
+	publish?: (models: ProviderModelConfig[], update: () => void) => Promise<boolean>;
+	// Bypass cache reads only when network is allowed; cache-only phases
+	// still prefer the matching catalog, even when forced.
 	forceRefresh?: boolean;
-}
-
-async function getDiscoveryApiKey(apiKey?: string): Promise<string | undefined> {
-	return resolveCursorApiKey(apiKey) ?? resolveCursorRuntimeApiKey();
 }
 
 export interface CursorModelMetadata {
@@ -53,6 +54,7 @@ export interface CursorModelMetadata {
 	selectionModelId: string;
 	displayName: string;
 	defaultParams: ModelParameterValue[];
+	catalogDefaultContext?: string;
 	context?: string;
 	contextWindow: number;
 	supportsFast: boolean;
@@ -65,6 +67,7 @@ export interface CursorModelMetadata {
 		reasoning: boolean;
 		effort: boolean;
 		thinking: boolean;
+		reasoning_effort: boolean;
 		fast: boolean;
 	};
 }
@@ -112,7 +115,7 @@ function mapComparableLevel(
 
 function getThinkingLevelMap(item: ModelListItem): ThinkingLevelMap | undefined {
 	const reasoningParameter = getParameter(item, "reasoning");
-	const effortParameter = getParameter(item, "effort");
+	const effortParameter = getParameter(item, "effort") ?? getParameter(item, "reasoning_effort");
 	const thinkingParameter = getParameter(item, "thinking");
 	const valueParameter = effortParameter ?? reasoningParameter ?? thinkingParameter;
 	if (!valueParameter) return undefined;
@@ -223,6 +226,7 @@ function toMetadata(
 		selectionModelId,
 		displayName: item.displayName || item.id,
 		defaultParams: cloneParams(defaultParams),
+		catalogDefaultContext: getParamValue(getDefaultParams(item), "context"),
 		...(context ? { context } : {}),
 		contextWindow: getContextWindow(contextWindowCache, contextWindowKeys, context, item.id),
 		supportsFast: getParameter(item, "fast") !== undefined,
@@ -235,6 +239,7 @@ function toMetadata(
 			reasoning: getParameter(item, "reasoning") !== undefined,
 			effort: getParameter(item, "effort") !== undefined,
 			thinking: getParameter(item, "thinking") !== undefined,
+			reasoning_effort: getParameter(item, "reasoning_effort") !== undefined,
 			fast: getParameter(item, "fast") !== undefined,
 		},
 	};
@@ -253,8 +258,8 @@ function toModelConfig(metadata: CursorModelMetadata, name: string): ProviderMod
 	};
 }
 
-function registerModelItems(items: ModelListItem[]): ProviderModelConfig[] {
-	metadataByPiModelId.clear();
+function registerModelItems(items: ModelListItem[], metadataMap = metadataByPiModelId): ProviderModelConfig[] {
+	metadataMap.clear();
 	const contextWindowCache = loadContextWindowCache();
 	return getCursorModelSelectionIdentities(items).map(({ model: item, selectionModelId, context, fastOverride, piModelId, contextWindowKey, baseContextWindowKey }) => {
 		const defaultParams = getDefaultParams(item);
@@ -270,7 +275,7 @@ function registerModelItems(items: ModelListItem[]): ProviderModelConfig[] {
 			[piModelId, contextWindowKey, baseContextWindowKey],
 			fastOverride,
 		);
-		metadataByPiModelId.set(piModelId, metadata);
+		metadataMap.set(piModelId, metadata);
 		const alias = selectionModelId === item.id ? undefined : selectionModelId;
 		return toModelConfig(metadata, getModelName(item, context, alias, fastOverride));
 	});
@@ -280,13 +285,14 @@ export function getCursorModelMetadata(modelId: string): CursorModelMetadata | u
 	return metadataByPiModelId.get(modelId);
 }
 
-export function getCursorModelMetadataEntries(): CursorModelMetadata[] {
-	return [...metadataByPiModelId.values()].map((metadata) => ({
-		...metadata,
-		defaultParams: cloneParams(metadata.defaultParams),
-		...(metadata.thinkingLevelMap ? { thinkingLevelMap: { ...metadata.thinkingLevelMap } } : {}),
-		parameterIds: { ...metadata.parameterIds },
-	}));
+/** Plain snapshot so another extension copy can install the serving catalog's capabilities. */
+export function snapshotCursorModelMetadata(): CursorModelMetadata[] {
+	return [...metadataByPiModelId.values()].map((entry) => structuredClone(entry));
+}
+
+export function replaceCursorModelMetadata(entries: readonly CursorModelMetadata[]): void {
+	metadataByPiModelId.clear();
+	for (const entry of entries) metadataByPiModelId.set(entry.piModelId, structuredClone(entry));
 }
 
 function setParam(params: ModelParameterValue[], id: string, value: string): void {
@@ -310,11 +316,12 @@ function applyThinkingLevel(
 ): void {
 	const mapped = metadata.thinkingLevelMap?.[level];
 	if (mapped === undefined || mapped === null) return;
+	const effortId = metadata.parameterIds.effort ? "effort" : metadata.parameterIds.reasoning_effort ? "reasoning_effort" : undefined;
 
 	if (level === "off") {
 		if (metadata.parameterIds.thinking && mapped === "false") {
 			setParam(params, "thinking", mapped);
-			deleteParam(params, "effort");
+			if (effortId) deleteParam(params, effortId);
 			return;
 		}
 		if (metadata.parameterIds.reasoning) {
@@ -323,9 +330,9 @@ function applyThinkingLevel(
 		return;
 	}
 
-	if (metadata.parameterIds.effort) {
+	if (effortId) {
 		if (metadata.parameterIds.thinking) setParam(params, "thinking", "true");
-		setParam(params, "effort", mapped);
+		setParam(params, effortId, mapped);
 		return;
 	}
 
@@ -354,22 +361,44 @@ export function buildCursorModelSelection(
 		setParam(params, "fast", fastEnabled ? "true" : "false");
 	}
 
+	// Grok 4.7 rejects its explicit catalog-default context. Keep the selected
+	// variant's metadata intact and leave effort, fast and other contexts explicit.
+	if (metadata.baseModelId === "grok-4.7" && metadata.catalogDefaultContext !== undefined &&
+		getParamValue(params, "context") === metadata.catalogDefaultContext) {
+		deleteParam(params, "context");
+	}
+
 	return params.length > 0 ? { id: metadata.selectionModelId, params } : { id: metadata.selectionModelId };
 }
 
-function sanitizeDiscoveryError(error: unknown, apiKey: string): string | undefined {
-	const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-	return scrubSensitiveText(message, apiKey).trim() || undefined;
+async function useFallbackModels(options: DiscoverModelsOptions, issue: CursorModelFallbackIssue): Promise<ProviderModelConfig[]> {
+	const { FALLBACK_MODEL_ITEMS } = await import("./cursor-fallback-models.generated.js");
+	return publishModelItems(FALLBACK_MODEL_ITEMS, options, issue);
 }
 
-async function useFallbackModels(options: DiscoverModelsOptions, issue: CursorModelFallbackIssue): Promise<ProviderModelConfig[]> {
-	options.onFallback?.(issue);
-	const { FALLBACK_MODEL_ITEMS } = await import("./cursor-fallback-models.generated.js");
-	return registerModelItems(FALLBACK_MODEL_ITEMS);
+async function publishModelItems(
+	items: ModelListItem[],
+	options: DiscoverModelsOptions,
+	issue?: CursorModelFallbackIssue,
+	cacheFingerprint?: string,
+): Promise<ProviderModelConfig[]> {
+	options.signal?.throwIfAborted();
+	const metadata = new Map<string, CursorModelMetadata>();
+	const models = registerModelItems(items, metadata);
+	const update = () => {
+		metadataByPiModelId.clear();
+		for (const [id, value] of metadata) metadataByPiModelId.set(id, value);
+		if (cacheFingerprint) saveModelListCache(cacheFingerprint, items);
+		if (issue) options.onFallback?.(issue);
+	};
+	if (options.publish) await options.publish(models, update);
+	else update();
+	return models;
 }
 
 export async function discoverModels(options: DiscoverModelsOptions = {}): Promise<ProviderModelConfig[]> {
-	const apiKey = await getDiscoveryApiKey(options.apiKey);
+	options.signal?.throwIfAborted();
+	const apiKey = normalizeCursorApiKey(options.apiKey);
 	if (!apiKey) {
 		return useFallbackModels(options, {
 			reason: "missing-api-key",
@@ -379,48 +408,58 @@ export async function discoverModels(options: DiscoverModelsOptions = {}): Promi
 
 	const keyFingerprint = fingerprintApiKey(apiKey);
 
-	if (!options.forceRefresh) {
-		const cachedModels = loadFreshCachedModels(keyFingerprint);
+	if (!options.forceRefresh || options.allowNetwork === false) {
+		const cachedModels = options.allowNetwork === false
+			? loadAnyCachedModelCatalog(keyFingerprint)?.models
+			: loadFreshCachedModels(keyFingerprint);
 		if (cachedModels && cachedModels.length > 0) {
-			return registerModelItems(cachedModels);
+			return publishModelItems(cachedModels, options);
 		}
+	}
+
+	if (options.allowNetwork === false) {
+		return useFallbackModels(options, {
+			reason: "cache-only",
+			message: `Using fallback Cursor models until a live catalog is requested. ${CATALOG_REFRESH_HINT}`,
+		});
 	}
 
 	try {
 		const { Cursor } = await loadCursorSdk();
+		options.signal?.throwIfAborted();
+		// SDK 1.0.37 CursorRequestOptions has no caller signal. A late response
+		// still cannot publish outside the native generation that requested it.
 		const models = await Cursor.models.list({ apiKey });
+		options.signal?.throwIfAborted();
 		if (models.length > 0) {
-			saveModelListCache(keyFingerprint, models);
-			return registerModelItems(models);
+			return publishModelItems(models, options, undefined, keyFingerprint);
 		}
 		return useFallbackModels(options, {
 			reason: "empty-model-list",
 			message: `Cursor model discovery returned no models. Using fallback Cursor models; verify ${AUTH_SETUP_HINT}. ${CATALOG_REFRESH_HINT}`,
 		});
 	} catch (error) {
-		const errorMessage = sanitizeDiscoveryError(error, apiKey);
+		options.signal?.throwIfAborted();
+		const errorMessage = sanitizeCursorProviderError(error, apiKey);
 		// Prefer a previously cached catalog over the generic bundled fallback when
 		// a live refresh fails (e.g. transient network/auth errors), but keep the
 		// provenance visible so refresh commands do not claim a live refresh worked.
 		const cachedCatalog = loadAnyCachedModelCatalog(keyFingerprint);
 		if (cachedCatalog && cachedCatalog.models.length > 0) {
-			options.onFallback?.({
+			return publishModelItems(cachedCatalog.models, options, {
 				reason: "cached-after-error",
-				message: `Cursor model discovery failed; using cached Cursor model catalog from ${new Date(cachedCatalog.fetchedAt).toISOString()}.${errorMessage ? ` ${errorMessage}` : ""}`,
-				...(errorMessage ? { errorMessage } : {}),
+				message: `Cursor model discovery failed; using cached Cursor model catalog from ${new Date(cachedCatalog.fetchedAt).toISOString()}. ${errorMessage}`,
+				errorMessage,
 			});
-			return registerModelItems(cachedCatalog.models);
 		}
 		return useFallbackModels(options, {
 			reason: "discovery-failed",
-			message: `Cursor model discovery failed${errorMessage ? `: ${errorMessage}` : ""}. Using fallback Cursor models; verify ${AUTH_SETUP_HINT}. ${CATALOG_REFRESH_HINT}`,
-			...(errorMessage ? { errorMessage } : {}),
+			message: `Cursor model discovery failed: ${errorMessage} Using fallback Cursor models; run /cursor-refresh-models to retry discovery.`,
+			errorMessage,
 		});
 	}
 }
 
 export const __testUtils = {
-	parseContextWindow,
 	registerModelItems,
-	normalizeApiKey: resolveCursorApiKey,
 };

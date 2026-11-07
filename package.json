@@ -1,6 +1,6 @@
 {
   "name": "pi-cursor-sdk",
-  "version": "0.3.6",
+  "version": "0.5.15",
   "description": "pi provider extension backed by @cursor/sdk local and cloud agents",
   "author": "Mitch Fultz (https://github.com/fitchmultz)",
   "license": "MIT",
@@ -103,6 +103,8 @@
     "scripts/lib/cursor-sdk-output-filter.d.mts",
     "scripts/lib/ensure-built.mjs",
     "README.md",
+    "docs/reference.md",
+    "docs/development.md",
     "docs/cursor-model-ux-spec.md",
     "docs/cursor-tool-surfaces.md",
     "docs/cursor-live-smoke-checklist.md",
@@ -117,15 +119,16 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=24"
   },
   "scripts": {
+    "check:compat": "npm run build && npm run verify && node --test test/ci-compatibility.test.mjs test/native-provider.test.mjs test/native-cursor-flow.test.mjs test/native-cursor-ownership.test.mjs test/native-cursor-prompt.test.mjs",
     "build": "node ./scripts/build.mjs",
     "prepare": "node ./scripts/prepare.mjs",
     "typecheck": "npm run typecheck:src && npm run typecheck:tests && npm run typecheck:replay-compile",
-    "typecheck:src": "tsc --noEmit",
-    "typecheck:tests": "tsc -p tsconfig.test.json --noEmit",
-    "typecheck:replay-compile": "tsc --noEmit -p test/tsconfig.json",
+    "typecheck:src": "node ./node_modules/typescript/bin/tsc --noEmit",
+    "typecheck:tests": "node ./node_modules/typescript/bin/tsc -p tsconfig.test.json --noEmit",
+    "typecheck:replay-compile": "node ./node_modules/typescript/bin/tsc --noEmit -p test/tsconfig.json",
     "verify": "npm run check:platform-smoke && npm run typecheck && npm test",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -151,7 +154,7 @@
     "debug:sdk-events": "node scripts/debug-sdk-events.mjs",
     "debug:provider-events": "node scripts/debug-provider-events.mjs",
     "debug:mcp-coldstart": "node scripts/probe-mcp-coldstart.mjs",
-    "check:platform-smoke": "node --check platform-smoke.config.mjs && node --check scripts/cloud-runtime-smoke.mjs && node --check scripts/lib/cloud-smoke-cleanup-evidence.mjs && node --check scripts/lib/cloud-smoke-artifacts.mjs && node --check scripts/lib/cloud-smoke-pi-runner.mjs && node --check scripts/lib/cloud-smoke-github.mjs && node --check scripts/lib/cloud-smoke-shutdown.mjs && node --check scripts/local-resume-cleanup-smoke.mjs && node --check scripts/local-resume-smoke.mjs && node --check scripts/lib/local-resume-smoke-harness.mjs && node --check scripts/platform-smoke.mjs && node --check scripts/platform-smoke/artifact-bundle-chunk.mjs && node --check scripts/platform-smoke/artifact-bundle-contract.mjs && node --check scripts/platform-smoke/artifact-fs-safety.mjs && node --check scripts/platform-smoke/artifact-anchored-extract.mjs && node --check scripts/platform-smoke/artifact-secrets.mjs && node --check scripts/platform-smoke/assertions.mjs && node --check scripts/platform-smoke/artifacts.mjs && node --check scripts/platform-smoke/card-detect.mjs && node --check scripts/platform-smoke/crabbox-runner.mjs && node --check scripts/platform-smoke/doctor.mjs && node --check scripts/platform-smoke/jsonl-text.mjs && node --check scripts/platform-smoke/live-suite-runner.mjs && node --check scripts/platform-smoke/local-resume-runner.mjs && node --check scripts/platform-smoke/pty-capture.mjs && node --check scripts/platform-smoke/render-ansi.mjs && node --check scripts/platform-smoke/scenarios.mjs && node --check scripts/platform-smoke/target-runtime.mjs && node --check scripts/platform-smoke/targets.mjs && node --check scripts/platform-smoke/visual-evidence.mjs && node --check scripts/platform-smoke/wrapped-line-match.mjs && vitest run test/platform-artifact-boundaries.test.ts test/platform-smoke-artifact-transport.test.ts test/cloud-smoke-helpers.test.ts test/cursor-sdk-cloud-list-runs-contract.test.ts test/smoke-cli-package-contracts.test.ts test/smoke-tooling.test.ts",
+    "check:platform-smoke": "node --check platform-smoke.config.mjs && node --check scripts/cloud-runtime-smoke.mjs && node --check scripts/lib/cloud-smoke-cleanup-evidence.mjs && node --check scripts/lib/cloud-smoke-artifacts.mjs && node --check scripts/lib/cloud-smoke-pi-runner.mjs && node --check scripts/lib/cloud-smoke-github.mjs && node --check scripts/lib/cloud-smoke-shutdown.mjs && node --check scripts/local-resume-cleanup-smoke.mjs && node --check scripts/local-resume-smoke.mjs && node --check scripts/lib/local-resume-smoke-harness.mjs && node --check scripts/platform-smoke.mjs && node --check scripts/platform-smoke/artifact-bundle-chunk.mjs && node --check scripts/platform-smoke/artifact-bundle-contract.mjs && node --check scripts/platform-smoke/artifact-fs-safety.mjs && node --check scripts/platform-smoke/artifact-anchored-extract.mjs && node --check scripts/platform-smoke/artifact-secrets.mjs && node --check scripts/platform-smoke/assertions.mjs && node --check scripts/platform-smoke/artifacts.mjs && node --check scripts/platform-smoke/card-detect.mjs && node --check scripts/platform-smoke/crabbox-runner.mjs && node --check scripts/platform-smoke/doctor.mjs && node --check scripts/platform-smoke/jsonl-text.mjs && node --check scripts/platform-smoke/live-suite-runner.mjs && node --check scripts/platform-smoke/local-resume-runner.mjs && node --check scripts/platform-smoke/pty-capture.mjs && node --check scripts/platform-smoke/render-ansi.mjs && node --check scripts/platform-smoke/scenarios.mjs && node --check scripts/platform-smoke/target-runtime.mjs && node --check scripts/platform-smoke/targets.mjs && node --check scripts/platform-smoke/visual-evidence.mjs && node --check scripts/platform-smoke/wrapped-line-match.mjs",
     "smoke:platform": "node scripts/platform-smoke.mjs",
     "smoke:platform:doctor": "node scripts/platform-smoke.mjs doctor",
     "smoke:platform:macos": "node scripts/platform-smoke.mjs run --target macos",
@@ -160,13 +163,18 @@
     "smoke:platform:all": "npm run smoke:platform:doctor && node scripts/platform-smoke.mjs run --target macos,ubuntu,windows-native"
   },
   "dependencies": {
-    "@cursor/sdk": "1.0.27",
-    "@hono/node-server": "2.0.12",
-    "@modelcontextprotocol/sdk": "1.30.0"
+    "@cursor/sdk": "1.0.40",
+    "@hono/node-server": "2.1.3",
+    "@modelcontextprotocol/hono": "2.0.2",
+    "@modelcontextprotocol/server": "2.3.1",
+    "hono": "4.13.13",
+    "zod": "4.6.6"
   },
   "bundledDependencies": [
     "@hono/node-server",
-    "@modelcontextprotocol/sdk"
+    "@modelcontextprotocol/hono",
+    "@modelcontextprotocol/server",
+    "hono"
   ],
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -175,15 +183,22 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.0",
-    "@earendil-works/pi-coding-agent": "0.84.0",
-    "@earendil-works/pi-tui": "0.84.0",
-    "@xterm/xterm": "^6.0.0",
-    "node-pty": "^1.1.0",
-    "playwright": "^1.60.0",
-    "typebox": "1.3.7",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.6"
+    "@connectrpc/connect": "2.2.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
+    "@modelcontextprotocol/client": "2.3.1",
+    "@types/node": "24.19.1",
+    "@typescript/typescript6": "6.0.2",
+    "@xterm/xterm": "6.0.0",
+    "cross-spawn": "7.0.6",
+    "esbuild": "0.28.2",
+    "node-pty": "1.1.0",
+    "playwright": "1.64.0",
+    "typebox": "1.3.36",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3",
+    "yaml": "2.9.1"
   },
   "pi": {
     "extensions": [
@@ -206,9 +221,5 @@
     "typebox": {
       "optional": true
     }
-  },
-  "bundleDependencies": [
-    "@hono/node-server",
-    "@modelcontextprotocol/sdk"
-  ]
+  }
 }

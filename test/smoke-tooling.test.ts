@@ -3,10 +3,10 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parseArgs as parsePiArgs } from "../node_modules/@earendil-works/pi-coding-agent/dist/cli/args.js";
 import { buildInitialMessage } from "../node_modules/@earendil-works/pi-coding-agent/dist/cli/initial-message.js";
-import { CURSOR_TOOL_PRESENTATION_SPECS } from "../src/cursor-tool-presentation-registry.js";
+import { CURSOR_REPLAY_SOURCE_TOOL_NAMES } from "../src/cursor-replay-source-names.js";
 import { getScenario, renderPrompt, SCENARIOS } from "../scripts/platform-smoke/scenarios.mjs";
 
 function run(command: string, args: string[], env = process.env, cwd = process.cwd()) {
@@ -46,19 +46,6 @@ try {
 		const result = run(process.execPath, ["--input-type=module", "-e", code]);
 		expect(result.status, result.stderr).toBe(0);
 		expect(result.stdout).toContain('{"mismatch":false,"windowsMatch":true}');
-	});
-
-	it("disables retry sync and captures full remote bundle output outside Crabbox's terminal ceiling", () => {
-		const runtime = readFileSync("scripts/platform-smoke/target-runtime.mjs", "utf8");
-		const crabbox = readFileSync("scripts/platform-smoke/crabbox-runner.mjs", "utf8");
-		expect(runtime).toMatch(/return await run\(targetName, leaseId, command, \{ \.\.\.options, sync: false \}\);/);
-		expect(runtime).toContain('{ timeout: 120_000, sync: false, config }');
-		expect(runtime).toContain("metadata.path !== PLATFORM_ARTIFACT_BUNDLE_PATH");
-		expect(readFileSync("scripts/platform-smoke/artifact-bundle-chunk.mjs", "utf8")).toContain("pathValue !== PLATFORM_ARTIFACT_BUNDLE_PATH");
-		expect(crabbox).toContain('args.push("--capture-stdout", opts.captureStdoutPath)');
-		for (const runner of ["scripts/platform-smoke/targets.mjs", "scripts/platform-smoke/local-resume-runner.mjs"]) {
-			expect(readFileSync(runner, "utf8"), runner).toContain("captureStdoutPath:");
-		}
 	});
 
 	it("isolates cloud smoke from user and project Cursor config", async () => {
@@ -128,6 +115,33 @@ try {
 		}
 	});
 
+	it.each([
+		{ lean: undefined, nativeTools: undefined },
+		{ lean: "1", nativeTools: undefined },
+		{ lean: undefined, nativeTools: "0" },
+		{ lean: "1", nativeTools: "0" },
+	])("pins Cloud smoke lean off with parent lean=$lean and nativeTools=$nativeTools", async ({ lean, nativeTools }) => {
+		const artifactRoot = mkdtempSync(join(tmpdir(), "cloud-smoke-lean-env-test-"));
+		vi.stubEnv("PI_CURSOR_LEAN", lean);
+		vi.stubEnv("PI_CURSOR_NATIVE_TOOLS", nativeTools);
+		vi.stubEnv("PI_CURSOR_RUNTIME", "local");
+		try {
+			const { buildCloudSmokeEnv } = await import("../scripts/cloud-runtime-smoke.mjs");
+			const env = buildCloudSmokeEnv(artifactRoot);
+
+			expect(env.PI_CURSOR_LEAN).toBe("0");
+			expect(env.PI_CURSOR_RUNTIME).toBe("cloud");
+			// Do not silently enable native tools against an explicit user opt-out.
+			expect(env.PI_CURSOR_NATIVE_TOOLS).toBe(nativeTools);
+			expect(process.env.PI_CURSOR_LEAN).toBe(lean);
+			expect(process.env.PI_CURSOR_NATIVE_TOOLS).toBe(nativeTools);
+			expect(process.env.PI_CURSOR_RUNTIME).toBe("local");
+		} finally {
+			vi.unstubAllEnvs();
+			rmSync(artifactRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("harvests exact Cloud cleanup IDs from session JSONL and framed lifecycle journals", async () => {
 		const artifactRoot = mkdtempSync(join(tmpdir(), "cloud-smoke-lifecycle-test-"));
 		try {
@@ -164,6 +178,9 @@ try {
 				baseEnv: {
 					...process.env,
 					PI_CURSOR_RUNTIME: "cloud",
+					PI_CURSOR_LEAN: "0",
+					PI_CURSOR_PI_TOOL_BRIDGE: "0",
+					PI_CURSOR_EXPOSE_BUILTIN_TOOLS: "0",
 					PI_CURSOR_CLOUD_ACK: "1",
 					PI_CURSOR_CLOUD_REPO: "ambient/repo",
 					PI_CURSOR_CLOUD_AUTO_CREATE_PR: "1",
@@ -179,19 +196,87 @@ try {
 			expect(env.PI_CURSOR_CLOUD_AUTO_CREATE_PR).toBeUndefined();
 			expect(env.PI_CURSOR_CLOUD_SKIP_REVIEWER_REQUEST).toBeUndefined();
 			expect(env.PI_CURSOR_CLOUD_ENV).toBeUndefined();
-			expect(env.PI_CURSOR_PI_TOOL_BRIDGE).toBe("0");
-			expect(env.PI_CURSOR_EXPOSE_BUILTIN_TOOLS).toBe("0");
+			expect(env.PI_CURSOR_LEAN).toBe("1");
+			expect(env.PI_CURSOR_PI_TOOL_BRIDGE).toBe("1");
+			expect(env.PI_CURSOR_EXPOSE_BUILTIN_TOOLS).toBe("1");
+			expect(env.PI_CURSOR_REGISTER_NATIVE_TOOLS).toBe("0");
 			const unsetEnv = buildLocalResumeSmokeEnv(artifactRoot, { localResumeEnv: "unset", baseEnv: { ...process.env, PI_CURSOR_LOCAL_RESUME: "1" } });
 			expect(unsetEnv.PI_CURSOR_LOCAL_RESUME).toBeUndefined();
 			const optOutEnv = buildLocalResumeSmokeEnv(artifactRoot, { localResumeEnv: "off", baseEnv: { ...process.env, PI_CURSOR_LOCAL_RESUME: "1" } });
 			expect(optOutEnv.PI_CURSOR_LOCAL_RESUME).toBe("0");
-			const bridgeEnv = buildLocalResumeSmokeEnv(artifactRoot, { bridge: true, exposeBuiltinTools: true });
+			const nativeBaseEnv = { ...process.env, PI_CURSOR_LEAN: "1", PI_CURSOR_PI_TOOL_BRIDGE: "1", PI_CURSOR_EXPOSE_BUILTIN_TOOLS: "1" };
+			const nativeEnv = buildLocalResumeSmokeEnv(artifactRoot, { lean: false, baseEnv: nativeBaseEnv });
+			expect(nativeEnv.PI_CURSOR_LEAN).toBe("0");
+			expect(nativeEnv.PI_CURSOR_PI_TOOL_BRIDGE).toBe("0");
+			expect(nativeEnv.PI_CURSOR_EXPOSE_BUILTIN_TOOLS).toBe("0");
+			expect(nativeBaseEnv.PI_CURSOR_LEAN).toBe("1");
+			const bridgeEnv = buildLocalResumeSmokeEnv(artifactRoot, { lean: false, bridge: true, exposeBuiltinTools: true, baseEnv: nativeBaseEnv });
+			expect(bridgeEnv.PI_CURSOR_LEAN).toBe("0");
 			expect(bridgeEnv.PI_CURSOR_PI_TOOL_BRIDGE).toBe("1");
 			expect(bridgeEnv.PI_CURSOR_EXPOSE_BUILTIN_TOOLS).toBe("1");
 			expect(env.PI_CODING_AGENT_DIR).toBe(join(artifactRoot, "agent"));
 			expect(existsSync(env.PI_CODING_AGENT_DIR!)).toBe(true);
 		} finally {
 			rmSync(artifactRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("forwards lean defaults and native surface overrides through the actual RPC launcher without spawning pi", () => {
+		const code = String.raw`
+import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { PassThrough } from "node:stream";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+const launches = [];
+childProcess.spawn = (_command, _args, options) => {
+  launches.push(options.env);
+  return { stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough() };
+};
+syncBuiltinESMExports();
+const { startRpc } = await import("./scripts/lib/local-resume-smoke-harness.mjs");
+delete process.env.CURSOR_LOCAL_RESUME_SMOKE_EXTENSION_PATH;
+const artifactDir = mkdtempSync(join(tmpdir(), "local-resume-launch-env-"));
+try {
+  const options = { artifactDir, sessionDir: join(artifactDir, "sessions"), sessionId: "offline-env-proof" };
+  await startRpc({ ...options, baseEnv: { PI_CURSOR_LEAN: "0" } }).stop();
+  await startRpc({ ...options, lean: false, baseEnv: { PI_CURSOR_LEAN: "1" } }).stop();
+  await startRpc({ ...options, lean: false, bridge: true, exposeBuiltinTools: true, baseEnv: { PI_CURSOR_LEAN: "1" } }).stop();
+  assert.deepEqual(launches.map(env => [env.PI_CURSOR_LEAN, env.PI_CURSOR_PI_TOOL_BRIDGE, env.PI_CURSOR_EXPOSE_BUILTIN_TOOLS]), [
+    ["1", "1", "1"], ["0", "0", "0"], ["0", "1", "1"],
+  ]);
+  console.log("local-resume-launch-env-ok");
+} finally {
+  rmSync(artifactDir, { recursive: true, force: true });
+}
+`;
+		const result = run(process.execPath, ["--input-type=module", "-e", code]);
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.stdout).toContain("local-resume-launch-env-ok");
+	});
+
+	it("holds lean off across every native-to-bridge transition and deleted-agent fallback", () => {
+		const smokeSource = readFileSync("scripts/local-resume-smoke.mjs", "utf8");
+		const toolSurfaceSource = smokeSource.slice(smokeSource.indexOf("async function runToolSurfaceSmoke()"), smokeSource.indexOf("async function runAbortSmoke()"));
+		const cleanupSource = readFileSync("scripts/local-resume-cleanup-smoke.mjs", "utf8");
+		for (const [source, count] of [[toolSurfaceSource, 3], [cleanupSource, 4]] as const) {
+			const launches = [...source.matchAll(/withRpc\(\{([^}]+)\},/g)];
+			expect(launches).toHaveLength(count);
+			for (const launch of launches) expect(launch[1]).toContain("lean: false");
+		}
+	});
+
+	it("isolates native platform replay from lean bridge, abort, and HTTP transport proof", () => {
+		const native = getScenario("cursor-native-visual-matrix")!;
+		expect({ PI_CURSOR_LEAN: "1", ...native.env }).toMatchObject({
+			PI_CURSOR_LEAN: "0", PI_CURSOR_REGISTER_NATIVE_TOOLS: "1", PI_CURSOR_PI_TOOL_BRIDGE: "0", PI_CURSOR_EXPOSE_BUILTIN_TOOLS: "0",
+		});
+		for (const suite of ["cursor-http1-live", "cursor-bridge-visual-matrix", "cursor-abort-cleanup"]) {
+			expect({ PI_CURSOR_LEAN: "0", ...getScenario(suite)!.env }, suite).toMatchObject({
+				PI_CURSOR_LEAN: "1", PI_CURSOR_REGISTER_NATIVE_TOOLS: "0", PI_CURSOR_PI_TOOL_BRIDGE: "1", PI_CURSOR_EXPOSE_BUILTIN_TOOLS: "1",
+			});
 		}
 	});
 
@@ -208,8 +293,8 @@ try {
 		expect(platformSmoke).not.toContain("Promise.all(targetRuns)");
 		expect(platformSmoke).toContain("Run one or more comma-separated targets sequentially");
 		const docs = readFileSync("docs/platform-smoke.md", "utf8");
-		expect(docs).toContain("release-gate entrypoint runs required targets sequentially");
-		expect(docs).toContain("Total wall time is therefore additive across required targets");
+		expect(docs).toContain("comprehensive entrypoint runs configured targets sequentially");
+		expect(docs).toContain("comprehensive path handles one target at a time");
 	});
 
 	it("passes live prompts through Pi's interactive initial-message contract", () => {
@@ -257,31 +342,89 @@ try {
 			cursorCalls: 1,
 			finalMarker: "HTTP1_LIVE_OK",
 			requiredCards: ["http1-status"],
-			env: { PI_CURSOR_HTTP_1_1: "1", PI_CURSOR_PI_TOOL_BRIDGE: "0", PI_CURSOR_SDK_EVENT_DEBUG: "1" },
+			env: { PI_CURSOR_LEAN: "1", PI_CURSOR_HTTP_1_1: "1", PI_CURSOR_PI_TOOL_BRIDGE: "1", PI_CURSOR_SDK_EVENT_DEBUG: "1" },
 		});
 	});
 
-	it("rejects invalid platform smoke targets and suites before Crabbox runs", () => {
-		const invalidTarget = run(process.execPath, ["scripts/platform-smoke.mjs", "run", "--target", "plan9"]);
-		expect(invalidTarget.status).toBe(2);
-		expect(invalidTarget.stderr).toContain("unknown target(s): plan9");
-		expect(invalidTarget.stderr).toContain("macos, ubuntu, windows-native");
+	it("preserves captured OSC-8 read labels and content exactly as xterm renders them", () => {
+		const code = String.raw`
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { stripVTControlCharacters } from "node:util";
+import { detectCards, assertRequiredCards } from "./scripts/platform-smoke/card-detect.mjs";
+const { Terminal } = createRequire(import.meta.url)("@xterm/xterm");
+const captures = JSON.parse(readFileSync("test/fixtures/platform-read-hyperlinks.json", "utf8"));
+for (const { lane, ansi } of captures) {
+  const term = new Terminal({ cols: 150, rows: 45, allowProposedApi: true });
+  try {
+    const split = ansi.indexOf("\x1b\\") + 1;
+    await new Promise(resolve => term.write(ansi.slice(0, split), resolve));
+    await new Promise(resolve => term.write(ansi.slice(split), resolve));
+    const visible = term.buffer.active.getLine(0).translateToString(true);
+    // Independent terminal interpretation, not a second regular-expression stripper.
+    assert.equal(stripVTControlCharacters(ansi).trim(), visible.trim());
+    const required = lane === "native" ? ["read"] : ["read", "bridge-read-success"];
+    assert(assertRequiredCards(".", detectCards([visible]), required).every(c => c.ok));
+    // BEL and ST are both valid OSC terminators; neither may eat visible content.
+    term.reset();
+    await new Promise(resolve => term.write(ansi.replaceAll("\x1b\\", "\x07"), resolve));
+    assert.equal(term.buffer.active.getLine(0).translateToString(true), visible);
+  } finally { term.dispose(); }
+}
+const content = captures[0].ansi + '  "name": "pi-cursor-sdk"\r\n' + captures[1].ansi + 'ENOENT: no such file\r\n';
+const plain = stripVTControlCharacters(content);
+assert(plain.includes('"name": "pi-cursor-sdk"'));
+const term = new Terminal({ cols: 150, rows: 45, allowProposedApi: true });
+try {
+  await new Promise(resolve => term.write(content, resolve));
+  const lines = Array.from({ length: term.buffer.active.length }, (_, i) => term.buffer.active.getLine(i).translateToString(true));
+  assert(lines.some(line => line.includes('"name": "pi-cursor-sdk"')));
+  assert(assertRequiredCards(".", detectCards(lines), ["read", "bridge-read-success", "bridge-read-failure"]).every(c => c.ok));
+} finally { term.dispose(); }
+assert.equal(detectCards(['1. call pi__read on ./package.json', 'read ./other.json']).length, 0);
+console.log("captured-osc8-read-cards-ok");
+`;
+		const result = run(process.execPath, ["--input-type=module", "-e", code]);
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.stdout).toContain("captured-osc8-read-cards-ok");
+	});
 
-		const invalidSuite = run(process.execPath, ["scripts/platform-smoke.mjs", "run", "--suite", "stdout-only"]);
-		expect(invalidSuite.status).toBe(2);
-		expect(invalidSuite.stderr).toContain("unknown suite(s): stdout-only");
-		expect(invalidSuite.stderr).toContain("platform-build");
+	it("preserves captured OSC-8 read labels in HTML fallback", () => {
+		const code = String.raw`
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
+import { renderHTML } from "./scripts/platform-smoke/render-ansi.mjs";
+const root = mkdtempSync(join(tmpdir(), "platform-osc8-capture-"));
+try {
+  const [{ ansi }] = JSON.parse(readFileSync("test/fixtures/platform-read-hyperlinks.json", "utf8"));
+  const rawPath = join(root, "terminal.ansi");
+  writeFileSync(rawPath, ansi);
+  const plain = stripVTControlCharacters(ansi);
+  const html = join(root, "terminal.html");
+  await renderHTML(rawPath, html);
+  const fallback = JSON.parse(readFileSync(html, "utf8").match(/const fallbackText = (.*);/)[1]);
+  assert.equal(fallback, plain);
+  console.log("osc8-html-fallback-ok");
+} finally { rmSync(root, { recursive: true, force: true }); }
+`;
+		const result = run(process.execPath, ["--input-type=module", "-e", code]);
+		expect(result.status, result.stderr).toBe(0);
+		expect(result.stdout).toContain("osc8-html-fallback-ok");
 	});
 
 	it("keeps card and bundle evidence checks strict against prompt/path false positives", () => {
 		const code = String.raw`
 import { detectCards, assertRequiredCards } from "./scripts/platform-smoke/card-detect.mjs";
 import { isSafeBundlePath } from "./scripts/platform-smoke/targets.mjs";
-const promptOnly = detectCards("1. call pi__read on ./package.json\n2. grep ./README.md\n");
-const rendered = detectCards("read /workspace/pi-cursor-sdk/package.json\ngrep /pi-cursor-sdk/ in C:/workspace/README.md\nbridge visual smoke\nENOENT: no such file or directory\ncursor:local · fast:off · http1\ngrok-4.6\n");
-const wrapped = detectCards("read /workspace/very-long-test-workspace/package.js\non\n");
-const wrappedMidToken = detectCards("read /workspace/very-long-test-workspace/package.j\nson\n");
-const localPreview = detectCards("read package.json · local file preview\n");
+const promptOnly = detectCards(["1. call pi__read on ./package.json", "2. grep ./README.md"]);
+const rendered = detectCards("read /workspace/pi-cursor-sdk/package.json\ngrep /pi-cursor-sdk/ in C:/workspace/README.md\nbridge visual smoke\nENOENT: no such file or directory\ncursor:local · fast:off · http1\ngrok-4.6\n".split("\n"));
+const wrapped = detectCards(["read /workspace/very-long-test-workspace/package.js", "on"]);
+const wrappedMidToken = detectCards(["read /workspace/very-long-test-workspace/package.j", "son"]);
+const localPreview = detectCards(["read package.json · local file preview"]);
 const checks = assertRequiredCards(".", rendered, ["bridge-read-success", "grep", "bridge-shell-success", "bridge-read-failure", "http1-status", "footer-status"]);
 const wrappedChecks = assertRequiredCards(".", wrapped, ["bridge-read-success"]);
 const wrappedMidTokenChecks = assertRequiredCards(".", wrappedMidToken, ["bridge-read-success"]);
@@ -522,19 +665,15 @@ if (!positiveItemsOk || promptOnly[0]?.ok !== false || wrapped[0]?.ok !== true |
 		expect(result.stdout).toContain('"localPreviewItemOk":true');
 	});
 
-	it("classifies every Cursor tool presentation surface for platform visual coverage", () => {
-		const classified = {
-			coveredByNativeVisualMatrix: ["read", "grep", "glob", "shell", "edit", "write"],
-			coveredByBridgeVisualMatrix: ["shell", "read"],
-			excludedFromPlatformVisualMatrix: ["ls", "delete", "readLints", "updateTodos", "createPlan", "task", "generateImage", "mcp", "semSearch", "recordScreen", "webSearch", "webFetch"],
-		};
-		const allClassified = new Set([
-			...classified.coveredByNativeVisualMatrix,
-			...classified.coveredByBridgeVisualMatrix,
-			...classified.excludedFromPlatformVisualMatrix,
-		]);
-		const registryNames = CURSOR_TOOL_PRESENTATION_SPECS.map((spec) => spec.normalizedName);
-		expect(new Set(registryNames)).toEqual(allClassified);
+	it("classifies every Cursor tool presentation surface in the documented platform visual matrix", () => {
+		const doc = readFileSync("docs/platform-smoke-implementation.md", "utf8");
+		const section = doc.slice(doc.indexOf("## Registry visual classification"), doc.indexOf("## Platform command rendering"));
+		const lists = section.split(/^(?:Required deterministic cards|Excluded from release visual matrix with required rationale):$/m);
+		expect(lists).toHaveLength(3);
+		const bullets = (list = "") => list.match(/^- .+$/gm) ?? [];
+		const requiredNames = bullets(lists[1]).map((line) => /`(\w+)`/.exec(line)?.[1]);
+		const excludedNames = bullets(lists[2]).map((line) => /^- `(\w+)`: \S/.exec(line)?.[1]);
+		expect(new Set([...requiredNames, ...excludedNames])).toEqual(new Set(CURSOR_REPLAY_SOURCE_TOOL_NAMES));
 	});
 
 });

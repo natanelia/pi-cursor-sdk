@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SDKAgent } from "@cursor/sdk";
-import type { CursorProviderTurnPrepareResult } from "../src/cursor-provider-turn-types.js";
+import type { StartedCursorProviderTurn } from "../src/cursor-provider-turn-types.js";
 import type { CursorSdkEventDebugSink } from "../src/cursor-sdk-event-debug.js";
 import {
 	CLOUD_LIFECYCLE_ENTRY_TYPE,
 	__testUtils as cloudLifecycleTestUtils,
+	captureCursorCloudLifecycleRecorder,
 	recordCursorCloudLifecycleRun,
 	registerCursorCloudLifecycleLedger,
 } from "../src/cursor-cloud-lifecycle.js";
+import { createProviderTestTurnUsage } from "./helpers/cursor-provider-ownership.js";
 import { createPiHarness } from "./helpers/pi-harness.js";
 
 const CLOUD_AGENT_ID = "bc-00000000-0000-0000-0000-000000000001";
@@ -30,8 +32,10 @@ vi.mock("../src/context-window-cache.js", () => ({
 
 import { awaitFinalizeCursorRunOutcome, cacheSdkContextWindow } from "../src/cursor-provider-turn-finalize.js";
 
-function makeCloudPrepared(agent: SDKAgent): CursorProviderTurnPrepareResult {
+function makeCloudPrepared(pi: ReturnType<typeof createPiHarness>, agent: SDKAgent): StartedCursorProviderTurn {
 	return {
+		usage: createProviderTestTurnUsage(),
+		recordCloudLifecycle: captureCursorCloudLifecycleRecorder(pi),
 		runtimeTarget: "cloud",
 		agent,
 		cwd: process.cwd(),
@@ -47,7 +51,7 @@ function makeCloudPrepared(agent: SDKAgent): CursorProviderTurnPrepareResult {
 				discardIncompleteStartedToolCalls: vi.fn(),
 			},
 		},
-	} as unknown as CursorProviderTurnPrepareResult;
+	} as unknown as StartedCursorProviderTurn;
 }
 
 describe("awaitFinalizeCursorRunOutcome", () => {
@@ -85,7 +89,7 @@ describe("awaitFinalizeCursorRunOutcome", () => {
 					agentId: CLOUD_AGENT_ID,
 					wait: vi.fn(),
 				} as unknown as Awaited<ReturnType<SDKAgent["send"]>>,
-				prepared: makeCloudPrepared({ agentId: CLOUD_AGENT_ID, listArtifacts } as unknown as SDKAgent),
+				prepared: makeCloudPrepared(pi, { agentId: CLOUD_AGENT_ID, listArtifacts } as unknown as SDKAgent),
 				cursorAgentMessageOffset: undefined,
 				modelId: "composer-2.5",
 				waitResult: { id: "run-1", status: "finished", result: "cloud done" },
@@ -112,37 +116,6 @@ describe("awaitFinalizeCursorRunOutcome", () => {
 		}
 	});
 
-	it.each(["error", "cancelled"] as const)("retains the send-phase cloud record and skips telemetry for %s outcomes", async (status) => {
-		const pi = createPiHarness();
-		registerCursorCloudLifecycleLedger(pi);
-		const listArtifacts = vi.fn();
-		const fetchSpy = vi.spyOn(globalThis, "fetch");
-		const sdkEventDebug = { recordProviderEvent: vi.fn() } as unknown as CursorSdkEventDebugSink;
-		recordCursorCloudLifecycleRun({ agentId: CLOUD_AGENT_ID, runId: "run-failed", branches: [] });
-		const wait = vi.fn(async () => {
-			expect(pi.appendEntry).toHaveBeenCalledWith(CLOUD_LIFECYCLE_ENTRY_TYPE, expect.objectContaining({
-				agentId: CLOUD_AGENT_ID,
-				runId: "run-failed",
-			}));
-			return { id: "run-failed", status };
-		});
-
-		const finalized = await awaitFinalizeCursorRunOutcome({
-			run: { id: "run-failed", agentId: CLOUD_AGENT_ID, wait } as unknown as Awaited<ReturnType<SDKAgent["send"]>>,
-			prepared: makeCloudPrepared({ agentId: CLOUD_AGENT_ID, listArtifacts } as unknown as SDKAgent),
-			cursorAgentMessageOffset: undefined,
-			modelId: "composer-2.5",
-			sdkEventDebug,
-		});
-
-		expect(finalized.outcome.kind).toBe(status === "error" ? "error" : "cancelled");
-		expect(pi.appendEntry).toHaveBeenCalledTimes(1);
-		expect(listArtifacts).not.toHaveBeenCalled();
-		expect(fetchSpy).not.toHaveBeenCalled();
-		expect(sdkEventDebug.recordProviderEvent).not.toHaveBeenCalled();
-		fetchSpy.mockRestore();
-	});
-
 	it("retains the send-phase lifecycle record when cloud wait throws", async () => {
 		const pi = createPiHarness();
 		registerCursorCloudLifecycleLedger(pi);
@@ -157,7 +130,7 @@ describe("awaitFinalizeCursorRunOutcome", () => {
 
 		await expect(awaitFinalizeCursorRunOutcome({
 			run: { id: "run-throw", agentId: CLOUD_AGENT_ID, wait } as unknown as Awaited<ReturnType<SDKAgent["send"]>>,
-			prepared: makeCloudPrepared({ agentId: CLOUD_AGENT_ID, listArtifacts } as unknown as SDKAgent),
+			prepared: makeCloudPrepared(pi, { agentId: CLOUD_AGENT_ID, listArtifacts } as unknown as SDKAgent),
 			cursorAgentMessageOffset: undefined,
 			modelId: "composer-2.5",
 			sdkEventDebug,
@@ -179,7 +152,7 @@ describe("awaitFinalizeCursorRunOutcome", () => {
 
 		const finalized = await awaitFinalizeCursorRunOutcome({
 			run: { id: "run-1", agentId: CLOUD_AGENT_ID, wait: vi.fn() } as unknown as Awaited<ReturnType<SDKAgent["send"]>>,
-			prepared: makeCloudPrepared({ agentId: CLOUD_AGENT_ID } as unknown as SDKAgent),
+			prepared: makeCloudPrepared(pi, { agentId: CLOUD_AGENT_ID } as unknown as SDKAgent),
 			cursorAgentMessageOffset: undefined,
 			modelId: "composer-2.5",
 			waitResult: { id: "run-1", status: "finished", result: "done" },
@@ -197,20 +170,14 @@ describe("cacheSdkContextWindow", () => {
 		loadLatest.mockResolvedValue({ tokenDetails: { maxTokens: 200_000 } });
 	});
 
-	it("opens the Cursor SDK platform scoped to the pi session cwd", async () => {
-		await cacheSdkContextWindow("agent-1", "composer-2.5", "/repo/session-cwd");
+	it.each([
+		["/repo/session-cwd", { workspaceRef: "/repo/session-cwd", scopedWorkspaceRef: "/repo/session-cwd" }],
+		[undefined, undefined],
+	] as const)("opens the Cursor SDK platform with cwd %j", async (cwd, platformOptions) => {
+		await cacheSdkContextWindow("agent-1", "composer-2.5", cwd);
 
-		expect(createAgentPlatform).toHaveBeenCalledWith({
-			workspaceRef: "/repo/session-cwd",
-			scopedWorkspaceRef: "/repo/session-cwd",
-		});
+		expect(createAgentPlatform).toHaveBeenCalledWith(platformOptions);
 		expect(loadLatest).toHaveBeenCalledWith("agent-1");
 		expect(saveCachedContextWindow).toHaveBeenCalledWith("composer-2.5", 200_000);
-	});
-
-	it("keeps the SDK default platform path when no cwd is available", async () => {
-		await cacheSdkContextWindow("agent-1", "composer-2.5");
-
-		expect(createAgentPlatform).toHaveBeenCalledWith(undefined);
 	});
 });

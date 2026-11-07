@@ -1,6 +1,6 @@
 # Platform Smoke Implementation Reference
 
-Back to the canonical [Platform Smoke Gate runbook](./platform-smoke.md) for release commands, required targets and suites, artifacts, assertions, security, and the release bar.
+Back to the canonical [Platform Smoke runbook](./platform-smoke.md) for cost-conscious verification, focused suite selection, optional comprehensive targets/suites, artifacts, assertions, security, and the release bar. Offline/faux checks and exact-input retained evidence come first; only necessary changed-behavior proof warrants the smallest live check on one representative environment. No paid Cloud testing for generic PRs/releases; only explicitly Cursor Cloud-focused PRs/issues may select a necessary focused Cloud check. Automated Cursor PR reviews continue unchanged.
 
 This document records detailed detector, registry, command-rendering, implementation-history, replacement, and portability material. The phase plan is retained as implementation history, not as active release instructions.
 
@@ -18,11 +18,15 @@ Required behavior:
 - fail when a card/evidence item has the wrong success/error state;
 - fail when footer/status is missing or unreadable.
 
+The legacy card inventory and required-card assertions use the same rendered xterm buffer lines already collected for visual evidence and screenshots. Raw ANSI stripping cannot reconstruct cursor movement, line erasure, or redraws; `terminal.txt` remains raw diagnostic text, not card evidence. Raw ANSI remains unchanged for xterm/PNG rendering and secret scanning; exact card patterns, wrapped-line matching, and JSONL success/error assertions still apply. `test/fixtures/platform-read-hyperlinks.json` retains minimal native/bridge OSC-8 headers from real captures with only the local hyperlink target anonymized.
+
+Run the host renderer regression with `node --test test/platform-smoke-rendered-cards.test.mjs`. It requires the host Playwright Chromium checked by platform doctor and fails, rather than skips, if rendering is unavailable. Default `npm test` does not require a guest/CI browser install; the full platform gate still requires doctor and live rendered-card evidence.
+
 Meaningful gap closed: earlier card assertions could pass when the prompt mentioned `pi__read` or a missing-file path even if the actual tool card/result never rendered. The gate now requires JSONL result evidence and per-evidence rendered screenshots for native read, native shell success/failure, native edit diffs, bridge read success/failure, and bridge shell success.
 
 ## Registry visual classification
 
-The implementation must classify every `CURSOR_TOOL_PRESENTATION_SPECS` entry from `src/cursor-tool-presentation-registry.ts` as required or excluded for the release visual gate. A validation check fails when a registry entry lacks classification.
+The implementation must classify every `CURSOR_TOOL_PRESENTATION_SPECS` entry from `src/cursor-tool-presentation-registry.ts` as required or excluded for the optional comprehensive visual matrix. `test/smoke-tooling.test.ts` fails when a registry tool name is missing from these lists or an excluded entry lacks a rationale.
 
 Required deterministic cards:
 
@@ -36,6 +40,7 @@ Required deterministic cards:
 
 Excluded from release visual matrix with required rationale:
 
+- `ls`: composer-2-5 does not route the deterministic source-enumeration step through the native `ls` surface reliably; the suite instead gates that behavior through a successful native `find` result for `src/cursor-provider.ts`.
 - `delete`: destructive and redundant with file mutation card coverage.
 - `readLints`: dependent on target diagnostics state.
 - `updateTodos`: model workflow dependent.
@@ -48,7 +53,7 @@ Excluded from release visual matrix with required rationale:
 - `webSearch`: network/search dependent.
 - `webFetch`: network dependent.
 
-Adding a registry entry requires adding it to the required or excluded list with rationale. `ls` is currently excluded from the required one-prompt matrix because composer-2-5 does not route the deterministic source-enumeration step through the native `ls` surface reliably; the suite instead gates that behavior through a successful native `find` result for `src/cursor-provider.ts`.
+Adding a registry entry requires adding it to the required or excluded list with rationale.
 
 ## Platform command rendering
 
@@ -174,8 +179,10 @@ Update:
 
 They must state:
 
-- required local release gate is `npm run smoke:platform:all`;
-- cloud-runtime changes additionally require `npm run smoke:cloud`;
+- offline/faux checks and exact-input retained proof come first; new live proof is limited to the smallest meaningful changed-behavior check on one representative environment;
+- `npm run smoke:platform:all` is an optional comprehensive matrix, not an unconditional commit/release gate;
+- no paid Cloud testing for generic PRs/releases; only explicitly Cursor Cloud-focused PRs/issues may select necessary focused Cloud proof, with unchanged run/evidence and cleanup contracts;
+- no full paid campaign replay, matrix-only host coverage, or automatic paid retries; automated Cursor PR reviews continue unchanged;
 - legacy smoke scripts are inner-loop/debug helpers;
 - `tmux` visual smoke is not the canonical cross-platform gate.
 
@@ -193,7 +200,7 @@ Replace or redesign this platform runner if any of these become true:
 - The full gate exceeds the fixed Cursor invocation budget.
 - Node 24 + `node-pty` cannot be made reliable on Windows native.
 
-If the gate is replaced, document the new cross-platform release process before removing this one. Existing local smoke scripts remain inner-loop/debug helpers, not release gates.
+If the runner is replaced, document the new verification process before removing it. Keep offline cross-platform contracts and selected-suite evidence fidelity; the comprehensive paid matrix is optional, not a default ship step.
 
 ## Portability to other pi extensions
 

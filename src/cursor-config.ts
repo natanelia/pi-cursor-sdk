@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { parseOptionalEnvBoolean } from "./cursor-env-boolean.js";
 import { asRecord } from "./cursor-record-utils.js";
 
@@ -36,6 +37,7 @@ export const CURSOR_SANDBOX_ENV = "PI_CURSOR_SANDBOX";
 export const CURSOR_LOCAL_FORCE_ENV = "PI_CURSOR_LOCAL_FORCE";
 export const CURSOR_LOCAL_RESUME_ENV = "PI_CURSOR_LOCAL_RESUME";
 export const CURSOR_HTTP1_ENV = "PI_CURSOR_HTTP_1_1";
+export const CURSOR_STATE_ROOT_ENV = "PI_CURSOR_SDK_STATE_ROOT";
 
 export type CursorConfigSource = "cli" | "environment" | "project" | "user" | "session" | "model-alias" | "builtin";
 export type CursorConfigTrustLevel = "one-shot" | "environment" | "trusted-project" | "user" | "session" | "model-catalog" | "builtin";
@@ -48,9 +50,20 @@ export interface CursorCloudEnvironmentConfig {
 	name?: string;
 }
 
+export interface CursorCustomSubagentConfig {
+	description: string;
+	prompt: string;
+	model?: string;
+	thinking?: ModelThinkingLevel;
+	fast?: boolean;
+}
+
+export type CursorCustomSubagentsConfig = Record<string, CursorCustomSubagentConfig>;
+
 export interface CursorSdkConfig {
 	fastDefaults?: Record<string, boolean>;
 	runtime?: CursorRuntime;
+	subagents?: CursorCustomSubagentsConfig;
 	cloud?: {
 		repo?: string;
 		branch?: string;
@@ -73,6 +86,7 @@ export interface CursorSdkConfig {
 		force?: boolean;
 		resume?: boolean;
 		useHttp1ForAgent?: boolean;
+		storeRoot?: string;
 	};
 }
 
@@ -94,6 +108,7 @@ export interface CursorResolvedSetting<T> {
 
 export interface CursorResolvedSdkConfig {
 	runtime: CursorResolvedSetting<CursorRuntime>;
+	subagents: CursorResolvedSetting<CursorCustomSubagentsConfig | undefined>;
 	cloud: {
 		repo: CursorResolvedSetting<string | undefined>;
 		branch: CursorResolvedSetting<string | undefined>;
@@ -113,6 +128,7 @@ export interface CursorResolvedSdkConfig {
 		force: CursorResolvedSetting<boolean>;
 		resume: CursorResolvedSetting<boolean>;
 		useHttp1ForAgent: CursorResolvedSetting<boolean>;
+		storeRoot: CursorResolvedSetting<string | undefined>;
 	};
 }
 
@@ -237,12 +253,53 @@ function parseCloudEnvironment(value: unknown): CursorCloudEnvironmentConfig | u
 	return Object.keys(parsed).length > 0 ? parsed : undefined;
 }
 
+const THINKING_LEVELS = {
+	off: true,
+	minimal: true,
+	low: true,
+	medium: true,
+	high: true,
+	xhigh: true,
+	max: true,
+} satisfies Record<ModelThinkingLevel, true>;
+
+function isCursorSubagentThinkingLevel(value: unknown): value is ModelThinkingLevel {
+	return typeof value === "string" && Object.hasOwn(THINKING_LEVELS, value);
+}
+
+function parseCustomSubagents(value: unknown): CursorCustomSubagentsConfig | undefined {
+	const record = asRecord(value);
+	if (!record) return undefined;
+	const entries: Array<[string, CursorCustomSubagentConfig]> = [];
+	for (const [name, raw] of Object.entries(record)) {
+		// Extension config policy, not an upstream SDK naming restriction.
+		if (!/^[A-Za-z][A-Za-z0-9._-]{0,63}$/.test(name)) continue;
+		const entry = asRecord(raw);
+		const description = parseNonEmptyString(entry?.description);
+		const prompt = parseNonEmptyString(entry?.prompt);
+		if (!entry || !description || !prompt) continue;
+		const model = parseNonEmptyString(entry.model);
+		const thinking = entry.thinking;
+		entries.push([name, {
+			description,
+			prompt,
+			...(model ? { model } : {}),
+			...(isCursorSubagentThinkingLevel(thinking) ? { thinking } : {}),
+			...(typeof entry.fast === "boolean" ? { fast: entry.fast } : {}),
+		}]);
+	}
+	return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
 export function parseCursorSdkConfig(value: unknown): CursorSdkConfig | undefined {
 	const record = asRecord(value);
 	if (!record) return undefined;
 	const config: CursorSdkConfig = {};
 
 	if (isCursorRuntime(record.runtime)) config.runtime = record.runtime;
+
+	const subagents = parseCustomSubagents(record.subagents);
+	if (subagents) config.subagents = subagents;
 
 	const fastDefaults = asRecord(record.fastDefaults);
 	if (fastDefaults) {
@@ -275,6 +332,7 @@ export function parseCursorSdkConfig(value: unknown): CursorSdkConfig | undefine
 	const local = asRecord(record.local);
 	if (local) {
 		const parsedLocal: NonNullable<CursorSdkConfig["local"]> = {};
+		if (typeof local.storeRoot === "string" && local.storeRoot.trim()) parsedLocal.storeRoot = local.storeRoot;
 		if (typeof local.autoReview === "boolean") parsedLocal.autoReview = local.autoReview;
 		if (typeof local.sandbox === "boolean") parsedLocal.sandbox = local.sandbox;
 		if (typeof local.force === "boolean") parsedLocal.force = local.force;
@@ -305,7 +363,7 @@ function readCursorSdkConfigFile(path: string): CursorSdkConfig {
 	}
 }
 
-export function loadCursorSdkConfigForUpdate(path: string): Record<string, unknown> {
+function loadCursorSdkConfigForUpdate(path: string): Record<string, unknown> {
 	if (!existsSync(path)) return {};
 	let source: string;
 	try {
@@ -418,19 +476,6 @@ export function updateCursorSdkConfig(
 	});
 }
 
-export function saveCursorSdkUserConfig(config: CursorSdkConfig, path = getCursorSdkUserConfigPath()): void {
-	updateCursorSdkConfig(path, () => ({ ...config }), { newFileMode: 0o600 });
-}
-
-export function saveCursorSdkProjectConfig(cwd: string, config: CursorSdkConfig, configDirName = CONFIG_DIR_NAME): void {
-	const path = getCursorSdkProjectConfigPath(cwd, configDirName);
-	updateCursorSdkConfig(path, () => ({ ...config }));
-}
-
-export function mergeCursorSdkConfig(base: CursorSdkConfig, patch: CursorSdkConfig): CursorSdkConfig {
-	return mergeCursorSdkConfigForUpdate({ ...base }, patch) as CursorSdkConfig;
-}
-
 export function mergeCursorSdkConfigForUpdate(
 	base: Record<string, unknown>,
 	patch: CursorSdkConfig,
@@ -460,16 +505,6 @@ export function mergeCursorSdkConfigForUpdate(
 
 export function cursorFastDefaultsFromConfig(config: CursorSdkConfig | undefined): Map<string, boolean> {
 	return new Map(Object.entries(config?.fastDefaults ?? {}));
-}
-
-export function withCursorFastDefaults<T extends object>(
-	config: T,
-	fastDefaults: Map<string, boolean>,
-): T & { fastDefaults: Record<string, boolean> } {
-	return {
-		...config,
-		fastDefaults: Object.fromEntries([...fastDefaults.entries()].sort(([a], [b]) => a.localeCompare(b))),
-	};
 }
 
 function resolved<T>(source: CursorConfigSource, value: T, cappedBy?: CursorSafetyCap<T>): CursorResolvedSetting<T> {
@@ -533,6 +568,8 @@ const CLOUD_ORDER: CursorFieldSource[] = ["cli", "environment", "session", "user
 const LOCAL_ORDER: CursorFieldSource[] = ["cli", "environment", "project", "user", "builtin"];
 const LOCAL_FORCE_ORDER: CursorFieldSource[] = ["cli", "environment", "builtin"];
 const HTTP1_ORDER: CursorFieldSource[] = ["session", "environment", "user", "builtin"];
+const SUBAGENTS_ORDER: CursorFieldSource[] = ["project", "user", "builtin"];
+const STORE_ROOT_ORDER: CursorFieldSource[] = ["environment", "user", "builtin"];
 
 function buildFieldLayers<T>(order: CursorFieldSource[], values: CursorFieldValues<T>): Array<CursorResolvedSetting<T> | undefined> {
 	return order.map((source) => (source === "builtin" ? resolved("builtin", values.builtin as T) : valueFrom(source, values[source])));
@@ -548,6 +585,16 @@ function resolveSafetyField<T>(order: CursorFieldSource[], values: CursorFieldVa
 
 function resolveEnvNamesSafetyField(order: CursorFieldSource[], values: CursorFieldValues<string[]>): CursorResolvedSetting<string[]> {
 	return resolveWithCap(buildFieldLayers(order, values), valueFrom("user", values.user), envNamesCap);
+}
+
+export function resolveCursorLocalStoreRoot(
+	{ env = process.env, user }: Pick<ResolveCursorSdkConfigOptions, "env" | "user"> = {},
+): CursorResolvedSetting<string | undefined> {
+	return resolveOrdinaryField(STORE_ROOT_ORDER, {
+		environment: env[CURSOR_STATE_ROOT_ENV]?.trim() ? env[CURSOR_STATE_ROOT_ENV] : undefined,
+		user: user?.local?.storeRoot?.trim() ? user.local.storeRoot : undefined,
+		builtin: undefined,
+	});
 }
 
 export function cursorSdkConfigFromEnv(env: Record<string, string | undefined> = process.env): CursorSdkConfig {
@@ -648,6 +695,11 @@ export function resolveCursorSdkConfig(options: ResolveCursorSdkConfigOptions = 
 			},
 			(value) => (value === "cloud" ? 1 : 0),
 		),
+		subagents: resolveOrdinaryField(SUBAGENTS_ORDER, {
+			project: parseCustomSubagents(project?.subagents),
+			user: parseCustomSubagents(user?.subagents),
+			builtin: undefined,
+		}),
 		cloud: {
 			repo: resolveOrdinaryField(CLOUD_ORDER, {
 				cli: cli?.cloud?.repo,
@@ -752,6 +804,7 @@ export function resolveCursorSdkConfig(options: ResolveCursorSdkConfigOptions = 
 			}),
 		},
 		local: {
+			storeRoot: resolveCursorLocalStoreRoot({ env: options.env, user }),
 			autoReview: resolveOrdinaryField(LOCAL_ORDER, {
 				cli: cli?.local?.autoReview,
 				environment: env.local?.autoReview,

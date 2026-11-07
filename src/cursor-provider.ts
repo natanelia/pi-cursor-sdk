@@ -9,8 +9,6 @@ import {
 } from "@earendil-works/pi-ai";
 import {
 	cursorLiveRuns,
-	DEFAULT_CURSOR_NATIVE_REPLAY_IDLE_DISPOSE_MS,
-	getPendingCursorLiveRun,
 	hasTrailingUserMessagesAfterToolResults,
 	releaseAllPendingCursorLiveRunsForTests,
 	resetCursorNativeReplayIdleDisposeMs,
@@ -22,8 +20,14 @@ import { installCursorSdkProcessErrorGuard } from "./cursor-sdk-process-error-gu
 import { sanitizeCursorProviderError } from "./cursor-provider-errors.js";
 import { resolveCursorApiKey } from "./cursor-api-key.js";
 import { CursorProviderTurnRunner } from "./cursor-provider-turn-runner.js";
-import { getCursorSessionScopeKey } from "./cursor-session-scope.js";
+import type { CursorTurnScope } from "./cursor-session-scope.js";
+import type { CursorPiToolBridge } from "./cursor-pi-tool-bridge.js";
+import type { CursorNativeToolDisplayState } from "./cursor-native-tool-display-state.js";
+import type { CursorCloudLifecycleRecorder } from "./cursor-cloud-lifecycle.js";
+import type { CursorRequestProvenance } from "./cursor-request-provenance.js";
+import type { CursorUsageRecorder } from "./cursor-usage-ledger.js";
 import { runExclusiveCursorSessionTurn, __testUtils as cursorSessionTurnQueueTestUtils } from "./cursor-session-turn-queue.js";
+import { withCursorSdkOutputNoticeHandler, type CursorSdkOutputNoticeHandler } from "./cursor-sdk-output-filter.js";
 
 function makeInitialMessage(model: Model<Api>): AssistantMessage {
 	return {
@@ -45,11 +49,23 @@ function makeInitialMessage(model: Model<Api>): AssistantMessage {
 	};
 }
 
+export interface CursorProviderOwnership {
+	scope: CursorTurnScope;
+	bridge?: CursorPiToolBridge;
+	nativeDisplay?: CursorNativeToolDisplayState;
+	recordCloudLifecycle: CursorCloudLifecycleRecorder;
+	request: CursorRequestProvenance;
+	usageRecorder: CursorUsageRecorder;
+	reportSdkNotice?: CursorSdkOutputNoticeHandler;
+}
+
 export function streamCursor(
 	model: Model<Api>,
 	context: Context,
-	options?: SimpleStreamOptions,
+	options: SimpleStreamOptions | undefined,
+	ownership: CursorProviderOwnership,
 ): AssistantMessageEventStream {
+	const { scope, bridge, nativeDisplay, recordCloudLifecycle, request, usageRecorder } = ownership;
 	const stream = createAssistantMessageEventStream();
 	const sdkEventDebugRef: { current?: CursorSdkEventDebugSink } = {};
 	attachCursorSdkEventDebugPiStreamTap(stream, sdkEventDebugRef);
@@ -59,6 +75,12 @@ export function streamCursor(
 
 		const runner = new CursorProviderTurnRunner({
 			model,
+			scope,
+			bridge,
+			nativeDisplay,
+			recordCloudLifecycle,
+			request,
+			usageRecorder,
 			context,
 			stream,
 			partial,
@@ -69,8 +91,8 @@ export function streamCursor(
 		try {
 			stream.push({ type: "start", partial });
 			await runExclusiveCursorSessionTurn(
-				getCursorSessionScopeKey(),
-				() => runner.run(installCursorSdkProcessErrorGuard()),
+				scope.scopeKey,
+				() => withCursorSdkOutputNoticeHandler(ownership.reportSdkNotice, () => runner.run(installCursorSdkProcessErrorGuard())),
 				options?.signal,
 			);
 		} catch (error) {
@@ -90,10 +112,7 @@ export function streamCursor(
 }
 
 export const __testUtils = {
-	DEFAULT_CURSOR_NATIVE_REPLAY_IDLE_DISPOSE_MS,
 	pendingCursorNativeRunCount: cursorLiveRuns.count,
-	getPendingCursorLiveRun,
-	getActiveCursorLiveRunForScope: cursorLiveRuns.getActiveForScope,
 	hasTrailingUserMessagesAfterToolResults,
 	setCursorNativeReplayIdleDisposeMs,
 	resetCursorNativeReplayIdleDisposeMs,

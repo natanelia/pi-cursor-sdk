@@ -1,3 +1,4 @@
+import { calculateCost } from "@earendil-works/pi-ai";
 import type { Api, AssistantMessage, Context, Model } from "@earendil-works/pi-ai";
 import {
 	CURSOR_APPROX_CHARS_PER_TOKEN,
@@ -112,7 +113,7 @@ export function isCursorSdkUsageSafeForPiMessage(turnUsage: CursorSdkTurnUsage, 
 export interface CursorSdkUsageApplyOptions {
 	runtime: CursorRuntime;
 	turn?: CursorSdkTurnUsage;
-	billed?: CursorSdkTurnUsage;
+	occupancyFloor?: number;
 }
 
 export function applyCursorSdkUsage(partial: AssistantMessage, turnUsage: CursorSdkTurnUsage): void {
@@ -121,84 +122,24 @@ export function applyCursorSdkUsage(partial: AssistantMessage, turnUsage: Cursor
 	partial.usage.output = turnUsage.outputTokens;
 	partial.usage.cacheRead = turnUsage.cacheReadTokens;
 	partial.usage.cacheWrite = turnUsage.cacheWriteTokens;
-	// totalTokens is context occupancy (full prompt + output), not the sum of spend components alone.
+	// Full prompt + output equals the sum of Pi's disjoint components.
 	partial.usage.totalTokens = turnUsage.inputTokens + turnUsage.outputTokens;
 }
 
-function isCompatibleCursorAssistantMeasurement(assistant: AssistantMessage, model: Model<Api>): boolean {
-	return assistant.api === model.api && assistant.provider === model.provider && assistant.model === model.id;
-}
-
-function getLatestCompactionBoundary(context: Context): { index: number; tokensBefore?: number } | undefined {
-	for (let index = context.messages.length - 1; index >= 0; index -= 1) {
-		const message = context.messages[index] as { role?: string; tokensBefore?: number };
-		if (message.role !== "compactionSummary") continue;
-		const tokensBefore = message.tokensBefore;
-		return {
-			index,
-			tokensBefore: Number.isFinite(tokensBefore) && tokensBefore !== undefined && tokensBefore > 0 ? Math.floor(tokensBefore) : undefined,
-		};
-	}
-	return undefined;
-}
-
-function getLastAcceptedContextOccupancy(context: Context, model: Model<Api>): number {
-	const boundary = getLatestCompactionBoundary(context);
-	for (let index = context.messages.length - 1; index >= 0; index -= 1) {
-		if (boundary && index < boundary.index) break;
-		const message = context.messages[index];
-		if (message.role !== "assistant" || !("usage" in message)) continue;
-		const assistant = message as AssistantMessage;
-		if (assistant.stopReason === "aborted" || assistant.stopReason === "error" || !assistant.usage) continue;
-		if (!isCompatibleCursorAssistantMeasurement(assistant, model)) continue;
-		const { usage } = assistant;
-		const total =
-			usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-		if (!Number.isFinite(total) || total <= 0 || total > model.contextWindow) continue;
-		if (boundary?.tokensBefore !== undefined && total >= boundary.tokensBefore) continue;
-		return total;
-	}
-	return 0;
-}
-
-export function applyCursorApproximateUsage(partial: AssistantMessage, model: Model<Api>, context: Context, sessionInputTokens: number): void {
+export function applyCursorApproximateUsage(partial: AssistantMessage, model: Model<Api>, context: Context, sessionInputTokens: number, occupancyFloor?: number): void {
 	const outputTokens = estimateCursorAssistantSessionOutputTokens(partial);
-	partial.usage.input = Math.max(0, sessionInputTokens);
+	const floor = occupancyFloor !== undefined && Number.isFinite(occupancyFloor) && occupancyFloor > 0 && occupancyFloor <= model.contextWindow ? occupancyFloor : 0;
+	const totalTokens = Math.max(
+		Math.max(0, sessionInputTokens) + outputTokens,
+		estimateCursorContextTotalTokens(partial, model, context),
+		floor,
+	);
+	// Estimated prompt components describe the same occupancy as totalTokens.
+	partial.usage.input = totalTokens - outputTokens;
 	partial.usage.output = outputTokens;
 	partial.usage.cacheRead = 0;
 	partial.usage.cacheWrite = 0;
-	// Never report less occupancy than the last compatible same-model in-window assistant measurement.
-	partial.usage.totalTokens = Math.max(
-		partial.usage.input + partial.usage.output,
-		estimateCursorContextTotalTokens(partial, model, context),
-		getLastAcceptedContextOccupancy(context, model),
-	);
-}
-
-function applyCursorOccupancyEstimate(partial: AssistantMessage, model: Model<Api>, context: Context): void {
-	partial.usage.totalTokens = Math.max(
-		estimateCursorContextTotalTokens(partial, model, context),
-		getLastAcceptedContextOccupancy(context, model),
-	);
-}
-
-function isCurrentLocalOccupancy(turn: CursorSdkTurnUsage, model: Model<Api>, context: Context): boolean {
-	if (!isCursorSdkUsageSafeForPiMessage(turn, model)) return false;
-	const tokensBefore = getLatestCompactionBoundary(context)?.tokensBefore;
-	return tokensBefore === undefined || turn.inputTokens + turn.outputTokens < tokensBefore;
-}
-
-function applyResolvedCursorOccupancy(
-	partial: AssistantMessage,
-	model: Model<Api>,
-	context: Context,
-	localTurn: CursorSdkTurnUsage | undefined,
-): void {
-	if (localTurn && isCurrentLocalOccupancy(localTurn, model, context)) {
-		partial.usage.totalTokens = localTurn.inputTokens + localTurn.outputTokens;
-		return;
-	}
-	applyCursorOccupancyEstimate(partial, model, context);
+	partial.usage.totalTokens = totalTokens;
 }
 
 export function applyCursorUsage(
@@ -208,18 +149,12 @@ export function applyCursorUsage(
 	sessionInputTokens: number,
 	sdkUsage?: CursorSdkUsageApplyOptions,
 ): void {
-	const billed = sdkUsage?.billed;
 	const localTurn = sdkUsage?.runtime === "local" ? sdkUsage.turn : undefined;
-	if (billed && isCursorSdkUsagePartitionSafe(billed, model)) {
-		applyCursorSdkUsage(partial, billed);
-		applyResolvedCursorOccupancy(partial, model, context, localTurn);
-		return;
-	}
-	// Only local raw turn-ended usage has a captured full-prompt/cache-partition occupancy contract.
 	if (localTurn && isCursorSdkUsageSafeForPiMessage(localTurn, model)) {
+		// Fresh LOCAL occupancy supersedes any previous request-provenance floor.
 		applyCursorSdkUsage(partial, localTurn);
-		applyResolvedCursorOccupancy(partial, model, context, localTurn);
-		return;
+	} else {
+		applyCursorApproximateUsage(partial, model, context, sessionInputTokens, sdkUsage?.occupancyFloor);
 	}
-	applyCursorApproximateUsage(partial, model, context, sessionInputTokens);
+	calculateCost(model, partial.usage);
 }

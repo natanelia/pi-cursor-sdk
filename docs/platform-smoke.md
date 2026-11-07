@@ -1,6 +1,6 @@
-# Platform Smoke Gate
+# Platform Smoke
 
-Status: current local-runtime release gate for Cursor provider/runtime changes. Cloud-runtime changes also require the separate paid `npm run smoke:cloud` gate. The Crabbox runner, packed-install platform-build suite, and real live PTY/ConPTY suite runner are implemented for macOS, Ubuntu, and Windows native targets with one-lease-per-target orchestration.
+Status: optional comprehensive local-runtime matrix plus focused changed-behavior checks. Offline/faux verification and exact-input retained-evidence reuse come first. Paid checks are only the smallest meaningful proof needed for changed behavior on one representative environment; docs/metadata-only changes need none. No full paid campaign replay, matrix-only host coverage, or automatic paid retries. No paid Cloud testing for generic PRs/releases; only PRs/issues explicitly focused on Cursor Cloud may select a necessary focused Cloud check. Automated Cursor PR reviews continue unchanged. The Crabbox runner, packed-install platform-build suite, and real live PTY/ConPTY suite runner are implemented for macOS, Ubuntu, and Windows native targets with one-lease-per-target orchestration.
 
 Detailed detector, registry, command-rendering, implementation-history, replacement, and portability reference: [Platform Smoke Implementation Reference](./platform-smoke-implementation.md).
 
@@ -12,48 +12,47 @@ Crabbox best-practice baseline applied from `~/Projects/crabbox`: Crabbox owns l
 
 ## Decision
 
-Crabbox is the required local platform smoke runner for `pi-cursor-sdk` releases that touch Cursor provider/runtime behavior. PRs that touch actual cloud runtime execution must also run `npm run smoke:cloud`.
+Keep offline cross-platform CI, build/type/package checks, and native/faux contracts. Reuse retained proof when its tested inputs are unchanged. If changed behavior needs new real-service proof, choose the smallest existing check and one representative environment. Source-file touch alone does not require a live run.
 
-Inner-loop checks remain useful, but they are not release gates:
+Offline checks:
 
 ```bash
 npm run verify
 npm pack --dry-run
 ```
 
-The required local release gate is exactly:
+Example focused live selection for changed restart behavior (choose the relevant suite/target, not this example by default):
+
+```bash
+node scripts/platform-smoke.mjs run --target macos --suite cursor-local-resume-restart
+```
+
+Optional comprehensive coverage, not an unconditional commit/release gate:
 
 ```bash
 npm run smoke:platform:all
 ```
 
-Cloud-runtime changes additionally require:
+That command runs doctor first, then all configured targets/suites. The CLI can run one existing suite on one target without running the full matrix. Doctor itself makes no Cursor calls but checks the comprehensive setup; it is not proof of a provider turn. Per-target commands without `--suite` run every configured suite on that target, so prefer explicit suite selection.
 
-```bash
-npm run smoke:cloud
-```
+Only a PR/issue explicitly focused on Cursor Cloud permits necessary paid Cloud testing; generic PRs/releases and incidental Cloud changes do not. Even for Cloud-focused work, `npm run smoke:cloud` is an optional multi-lane matrix, not mandatory. Select coverage only when its live proof is needed, retaining the selected check's full assertions and cleanup contract.
 
-`smoke:platform:all` runs `smoke:platform:doctor` first and only starts the target matrix after doctor passes. Maintainers may still run `npm run smoke:platform:doctor` by itself for setup diagnosis.
-
-
-Per-target commands exist for diagnosis and iteration. They are not additional release-gate commands because requiring each per-target command plus `all` doubles Cursor token use.
-
-No partial adoption exists. The release evidence must include macOS, Ubuntu, and Windows native passing through `smoke:platform:all`.
+Do not repeat successful unchanged lanes or automatically retry paid failures. Preserve raw failed evidence, diagnose offline, and choose another call only when necessary. Report selected scope honestly; optional unrun hosts/lanes do not block landing, and focused evidence is not full-matrix proof.
 
 ## Non-negotiable constraints
 
 - No GitHub Actions dependency.
-- No cloud provider dependency in the default local platform gate; cloud-runtime changes use the separate paid cloud gate.
+- No paid Cloud testing for generic PRs/releases. Explicitly Cursor Cloud-focused PRs/issues are the only testing exception; keep Cloud checks separate from local checks.
 - No Crabbox broker/coordinator dependency.
-- No release gate that runs on only one operating system.
-- No release gate that proves command behavior but not TUI visual behavior.
-- No platform release gate based on `pi -e .`.
-- No skipped target because setup is missing; missing setup is a doctor failure.
+- Keep offline cross-platform coverage; do not require a paid host matrix merely for matrix coverage.
+- Visual claims require rendered evidence, not command success alone.
+- Packed-install claims require packed-install evidence; direct `pi -e .` proof has a narrower scope.
+- Missing setup fails a selected check; optional unselected targets are not failed release prerequisites.
 - No one-prompt-per-card visual matrix.
 - No `tmux` as the canonical visual test contract.
 - No target passes from stdout alone when JSONL or visual proof is required.
 - No target loses artifacts on failure.
-- No hidden optional evidence. Every required artifact is produced or the suite fails.
+- Every selected suite retains its required artifacts and assertions or fails. Do not weaken a check to reduce cost.
 
 ## Required Crabbox baseline
 
@@ -67,7 +66,7 @@ version: 0.26.0 or newer
 binary: Homebrew `crabbox` on PATH (`/opt/homebrew/bin/crabbox` on Apple Silicon Homebrew installs)
 ```
 
-Use the Homebrew Crabbox binary on PATH for normal release gates. `PLATFORM_SMOKE_CRABBOX=/path/to/crabbox` is only an explicit override for testing a non-default binary. `smoke:platform:doctor` verifies the configured binary and fails when it is older than the configured minimum version.
+Use the Homebrew Crabbox binary on PATH for selected platform checks. `PLATFORM_SMOKE_CRABBOX=/path/to/crabbox` is only an explicit override for testing a non-default binary. `smoke:platform:doctor` verifies the configured binary and fails when it is older than the configured minimum version.
 
 Required Crabbox providers:
 
@@ -106,7 +105,7 @@ Rendering is host-side. Targets capture the real ANSI stream; the macOS host ren
 
 ## Target session model
 
-Each target opens one Crabbox target session, syncs once, runs all suites for that target under one coherent target run id, collects artifacts, and stops/releases the target. The release-gate entrypoint runs required targets sequentially to prevent shared host, VM/container, and Cursor API contention; each target runs its own suites in order and fails fast within that target. Platform smoke disables Crabbox git-seed sync (`CRABBOX_SYNC_GIT_SEED=false`) so every run tests the current local checkout and uncommitted smoke-runner changes rather than a remote Git seed.
+Each selected target opens one Crabbox session, syncs once, runs selected suites under one coherent run id, collects artifacts, and stops/releases the target. The comprehensive entrypoint runs configured targets sequentially to prevent shared host, VM/container, and Cursor API contention; each target runs its own suites in order and fails fast within that target. Platform smoke disables Crabbox git-seed sync (`CRABBOX_SYNC_GIT_SEED=false`) so every run tests the current local checkout and uncommitted smoke-runner changes rather than a remote Git seed.
 
 ```text
 start target session
@@ -135,18 +134,18 @@ start target session
 end target session
 ```
 
-The target session fails fast. The release-gate path handles one target at a time: it warms one Crabbox lease, performs one fresh sync, runs suites in order, and stops that target after the first failure before starting the next target. Total wall time is therefore additive across required targets; this avoids nondeterministic worker loss and live-run stalls from competing VM/container load and concurrent Cursor API calls. Per-suite commands remain available for diagnosis, but they are intentionally not the normal release path because repeated warmup/sync/install cycles make releases too slow.
+The target session fails fast. The comprehensive path handles one target at a time: it warms one lease, syncs once, runs suites in order, and stops the target after its first failure before starting the next. This avoids competing VM/container load and Cursor calls. Routine verification should instead select the smallest meaningful changed-behavior suite on one representative target; do not replay the full campaign or duplicate a focused run with the full matrix.
 
 Runtime budget is part of the contract:
 
 - `smoke:platform:doctor` never calls Cursor.
-- `platform-build` runs once per target and is the only suite that performs the full local CI/build/typecheck/package gate. Its target invocations raise only Vitest's default per-test timeout to 15 seconds for host-contention headroom; normal `npm test` keeps the 5-second default, and explicit longer integration-test timeouts still apply.
+- `platform-build` runs once per target and is the only suite that performs the full local CI/build/typecheck/package gate. TypeScript 7 owns builds and package type checks; dev-only `@typescript/typescript6` is used only by the AST architecture test because TypeScript 7 has no stable compiler API. Vitest 5 defaults `clearMocks` to `true`. Target invocations raise only Vitest's default per-test timeout to 15 seconds for host-contention headroom; normal `npm test` keeps the 5-second default, and explicit longer integration-test timeouts still apply.
 - Live suites reuse the target checkout and prepared `node_modules` when run after `platform-build`; they do not repeat `npm ci` in a target-session release run. Their interactive Pi process sets `PI_OFFLINE=1` to skip unrelated startup catalog/update probes; the scenario's explicit Cursor provider turn remains live. The PTY launches Pi's JavaScript entry with direct Node argv so multiline prompts remain one positional message on every target.
 - Live and local-resume suites share one target-local packed-install prep directory per target-session release run. The first such suite runs `npm pack` and `npm install --no-save <tarball>` once. Visual/abort suites install that packed path with `pi install --approve -l`; local-resume lanes pass the same packed package path to their source-tree smoke harness instead of loading the checkout extension.
 - Visual coverage is batched into one native prompt, one focused HTTP/1.1 transport prompt, one bridge prompt, and one abort/cleanup prompt per target. Do not split the card matrices into one prompt per card.
 - The gate is fail-fast by target to avoid burning Cursor calls after a platform has already failed.
 
-## Required targets
+## Comprehensive matrix targets
 
 | Target | Crabbox provider | Execution contract | TUI visual contract |
 | --- | --- | --- | --- |
@@ -156,15 +155,15 @@ Runtime budget is part of the contract:
 
 Ubuntu is covered as its own local-container target, and Windows native remains a full visual TUI target.
 
-## Required cloud smoke gate
+## Explicit Cursor Cloud-focused testing exception
 
-Cloud validation stays separate from `smoke:platform:all`. Releases that touch actual cloud execution must run both the local platform gate and:
+No paid Cloud testing for generic PRs or releases. Only a PR or issue explicitly focused on Cursor Cloud may select necessary paid Cloud proof, after offline/faux checks and retained-evidence reuse. Incidental Cloud code changes do not qualify. The no-flag multi-lane command remains callable but is not mandatory even for Cloud-focused work:
 
 ```bash
 npm run smoke:cloud
 ```
 
-The no-flag command is the required `cursor/grok-4.6` matrix. It uses current `gh` CLI authentication to create one private throwaway GitHub repository, seeds clean `main`, `starting-ref`, and `direct-push` branches, and runs persisted-session named lanes for:
+This optional `cursor/grok-4.6` matrix retains its complete run/evidence and cleanup contract. It uses current `gh` CLI authentication to create one private throwaway GitHub repository, seeds clean `main`, `starting-ref`, and `direct-push` branches, and runs persisted-session named lanes for:
 
 - cancellation, with exact agent/run IDs captured before abort, retained `runIdSource` (`metadata` or installed-SDK `Agent.listRuns()` recovery), and terminal `cancelled` independently read through the SDK;
 - explicit HTTPS repository plus `startingRef`, requiring a distinct pushed cloud branch with remote-content and starting-ref-ancestry proof, recording whether the SDK returned branch metadata, and validating any returned PR URL through GitHub;
@@ -179,13 +178,15 @@ Every path harvests exact IDs from provider metadata and canonical lifecycle ses
 
 Before removing successful raw artifacts, the gate atomically replaces `docs/evidence/cursor-cloud-smoke-matrix-latest.json` with a known-shape summary containing timestamp, model, lane observations, exact agent/run IDs, agent cleanup proof, repository cleanup proof, and retained evidence provenance. Provenance records the extension package version, installed `@cursor/sdk` version, git source revision, and a deterministic `packageSourceSha256` over the full published package surface from `package.json` `files` plus `package.json` itself (relative path + bytes; directories expanded; symlinks/non-regular paths rejected). Generated `docs/evidence/*` is outside that published surface and is not hashed. Because successful pre-commit checkouts may be uncommitted, the package-source hash is authoritative for code identity and the revision is baseline identity only. The summary is a runtime-validated known shape (explicit six-lane allowlist, complete lane-agent cleanup coverage, repository proof, provenance) that round-trips through the persisted-evidence validator with no prompts or raw output, and must pass canonical secret scrubbing plus forbidden-field scanning; a run or cleanup failure observed before the atomic rename commit point never overwrites the last successful summary. A signal first dispatched after that point can fail the process while retaining the newly committed completed-cleanup summary, as defined above. Offline release-gate resource coordination (run → harvest IDs → cleanup agents → cleanup repo → evidence only on complete success) lives in `coordinateCloudSmokeReleaseGate()` inside `scripts/lib/cloud-smoke-cleanup-evidence.mjs`. GitHub throwaway fixture ownership lives in `scripts/lib/cloud-smoke-github.mjs`, signal-safe child shutdown lives in `scripts/lib/cloud-smoke-shutdown.mjs`, and `scripts/cloud-runtime-smoke.mjs` keeps concrete lane logic.
 
-`npm run smoke:cloud:context` (`--context-matrix`) remains optional, separate proof for fresh-versus-bootstrap context handoff. `fresh` must answer `NO_MARKER`; `bootstrap` must recall the marker. Its agents receive the same archive, delete, `Agent.get` not-found/404, and archived-inclusive list-exclusion verification, but it does not create a GitHub repository or replace the required-matrix evidence summary.
+Only within the explicitly Cursor Cloud-focused exception, `npm run smoke:cloud:context` (`--context-matrix`) remains optional, separate proof for fresh-versus-bootstrap context handoff. `fresh` must answer `NO_MARKER`; `bootstrap` must recall the marker. Its agents receive the same archive, delete, `Agent.get` not-found/404, and archived-inclusive list-exclusion verification, but it does not create a GitHub repository or replace the required-matrix evidence summary.
 
-This cloud gate does not replace the local macOS/Ubuntu/Windows `smoke:platform:all` gate.
+Cloud product capabilities and offline contracts remain supported. Neither this Cloud matrix nor the comprehensive local matrix is an unconditional ship requirement.
 
 ## Focused local resume smoke
 
-The platform matrix includes the required local-resume lanes: restart, safety, tool-surface, abort, tree, copy/switch, fallback, compaction, default/opt-out proof, and recorded-ID-only cleanup. Platform lanes run those scripts against the target's shared packed package path, then copy each lane's session JSONL, Cursor SDK debug metadata, runtime-launch record, and other bounded smoke artifacts into its canonical platform suite directory. The same scripts still load the source checkout by default when run directly as focused host-local inner-loop checks. Windows uses the intentionally short target-side evidence component `lr` so the Cursor SDK's derived SQLite path remains below legacy `MAX_PATH`; every suite removes and verifies that directory before use, failing closed on stale or locked evidence.
+The optional comprehensive platform matrix includes these local-resume lanes: restart, safety, tool-surface, abort, tree, copy/switch, fallback, compaction, default/opt-out proof, and recorded-ID-only cleanup. Platform lanes run those scripts against the target's shared packed package path, then copy each lane's session JSONL, Cursor SDK debug metadata, runtime-launch record, and other bounded smoke artifacts into its canonical platform suite directory. The same scripts still load the source checkout by default when run directly as focused host-local inner-loop checks. Windows uses the intentionally short target-side evidence component `lr` so the Cursor SDK's derived SQLite path remains below legacy `MAX_PATH`; every suite removes and verifies that directory before use, failing closed on stale or locked evidence.
+
+Ordinary local-resume lanes pin `PI_CURSOR_LEAN=1`, enable the pi bridge and builtin tools, and disable native replay registration regardless of inherited shell settings. The tool-surface and cleanup lanes instead pin `PI_CURSOR_LEAN=0` for every launch in their native-to-bridge transition proof. Without that opt-out, lean forces the bridge and builtins on for both sides, so the legacy surface pins cannot change the resume pool key. This is test isolation, not a change to the product default.
 
 The smoke starts one sessionful local Cursor run with local resume enabled by default, records the SDK agent id from provider debug metadata, restarts pi against the same session, asks for the remembered marker, and verifies:
 
@@ -196,7 +197,7 @@ The smoke starts one sessionful local Cursor run with local resume enabled by de
 
 The safety lane verifies an original session resumes the same local agent after restart, then proves cloned-session copied resume entries and a fork before a future-marker prompt both create a new local `agent-*`. The forked earlier branch must not reveal the future marker.
 
-The tool-surface lane verifies same-session restart reuses the original local agent with the same bridge/tool surface, then enables the builtin pi tool bridge surface and verifies the old resume handle is rejected, a bridge run is created, a new local `agent-*` is used, and a new resume pool key is persisted.
+The tool-surface lane holds `PI_CURSOR_LEAN=0` throughout, verifies same-session restart reuses the original local agent with the same native/bridge-off surface, then enables the builtin pi tool bridge surface and verifies the old resume handle is rejected, a bridge run is created, a new local `agent-*` is used, and a new resume pool key is persisted.
 
 The abort lane verifies a completed bridge-enabled turn persists a local resume handle, an interrupted long-running bridge turn starts from that handle but does not append a new one, and the next same-surface restart uses a new local `agent-*` instead of resuming the pre-abort agent.
 
@@ -210,7 +211,7 @@ The compaction lane uses an isolated temp pi settings file with `compaction.keep
 
 The default/opt-out lane verifies the built-in local resume default resumes, then verifies `PI_CURSOR_LOCAL_RESUME=0` opts out and creates a new agent while bootstrapping the transcript.
 
-The cleanup lane verifies `/cursor-local-resume-cleanup --dry-run` reports only recorded superseded local `agent-*` IDs, `/cursor-local-resume-cleanup --yes` verifies and fsyncs intent before deleting exactly the old recorded ID and fsyncs the result afterward, the current recorded agent still resumes, and tree navigation to the old handle falls back instead of resuming the deleted agent.
+The cleanup lane first replaces a native/bridge-off agent with a bridge-enabled agent while holding `PI_CURSOR_LEAN=0`, then verifies `/cursor-local-resume-cleanup --dry-run` reports only recorded superseded local `agent-*` IDs, `/cursor-local-resume-cleanup --yes` verifies and fsyncs intent before deleting exactly the old recorded ID and fsyncs the result afterward, the current recorded agent still resumes, and tree navigation to the old handle falls back instead of resuming the deleted agent.
 
 ## Files and scripts
 
@@ -253,7 +254,7 @@ Package scripts:
 
 ```json
 {
-  "check:platform-smoke": "node --check platform-smoke.config.mjs && node --check <platform smoke scripts> && vitest run test/platform-artifact-boundaries.test.ts test/platform-smoke-artifact-transport.test.ts test/cloud-smoke-helpers.test.ts test/cursor-sdk-cloud-list-runs-contract.test.ts test/smoke-cli-package-contracts.test.ts test/smoke-tooling.test.ts",
+  "check:platform-smoke": "node --check platform-smoke.config.mjs && node --check <platform smoke scripts>",
   "smoke:platform": "node scripts/platform-smoke.mjs",
   "smoke:platform:doctor": "node scripts/platform-smoke.mjs doctor",
   "smoke:platform:macos": "node scripts/platform-smoke.mjs run --target macos",
@@ -308,8 +309,8 @@ export default {
     install: "Homebrew package or PLATFORM_SMOKE_CRABBOX override",
     minVersion: "0.26.0",
   },
-  ubuntuContainerImage: "pi-cursor-sdk-platform-node:24.16-root",
-  ubuntuContainerBaseImage: "cimg/node:24.16",
+  ubuntuContainerImage: "pi-cursor-sdk-platform-node:24.21-root",
+  ubuntuContainerBaseImage: "cimg/node:24.21",
   nodeValidationMajor: 24,
   windowsParallels: {
     sourceVm: "pi-extension-windows-template",
@@ -319,7 +320,7 @@ export default {
 };
 ```
 
-`ubuntuContainerBaseImage` is the Ubuntu 24.04 Node 24 base with the current glibc baseline for native test dependencies. The runner builds the local `ubuntuContainerImage` wrapper with only `USER root` changed before warmup because Crabbox 0.36.0 must install SSH/Git/rsync/curl during bootstrap and `cimg/node` defaults to an unprivileged user. An explicit `PLATFORM_SMOKE_UBUNTU_IMAGE` bypasses that build and must already support Crabbox bootstrap. `nodeValidationMajor: 24` is the release-smoke validation baseline. It does not change the package engine by itself. A separate compatibility lane can test Node 22.19 later; this required gate validates Node 24 on every target.
+`ubuntuContainerBaseImage` is `cimg/node:24.21`, the Ubuntu 24.04 Node 24 base with the current glibc baseline for native test dependencies. The runner builds the local `ubuntuContainerImage` wrapper with only `USER root` changed before warmup because Crabbox 0.36.0 must install SSH/Git/rsync/curl during bootstrap and `cimg/node` defaults to an unprivileged user. An explicit `PLATFORM_SMOKE_UBUNTU_IMAGE` bypasses that build and must already support Crabbox bootstrap. The package requires Node 24+, and this gate validates Node 24 on macOS, Ubuntu, and Windows.
 
 `windowsParallels` records this repo's default shared Windows template contract. Environment overrides may point at a temporary candidate template during infrastructure work, but release runs should use the shared `pi-extension-windows-template` / `crabbox-ready` baseline unless this document is updated.
 
@@ -495,8 +496,8 @@ Per target, `platform-build` must:
 
 1. Record `node --version` and assert the target Node major is at least `nodeValidationMajor`.
 2. Run `npm ci` in `extensionSourceRoot`.
-3. Run `npm run check:platform-smoke` on the target so config syntax, smoke harness syntax, invalid target/suite guards, and invariant tests fail before live Cursor calls.
-4. Run `npm test` on the target with the same target-local release-tag guard bypass.
+3. Run `npm run check:platform-smoke` on the target to check config and smoke harness syntax.
+4. Run `npm test` on the target with the same target-local release-tag guard bypass; this includes the smoke guards and invariant tests before live Cursor calls.
 5. Run `npm run typecheck`.
 6. Run `npm pack`.
 7. Create `testWorkspaceRoot` with deterministic fixture files copied from the repo.
@@ -524,7 +525,7 @@ Cursor calls: `2`.
 
 Purpose:
 
-- prove guarded local resume default-on behavior across a pi process restart on each required OS;
+- prove guarded local resume default-on behavior across a pi process restart on each selected OS;
 - assert the first turn creates a local `agent-*` and the second turn resumes the same `agent-*`;
 - force local runtime and clear cloud env knobs so ambient cloud settings cannot satisfy this suite.
 
@@ -554,12 +555,15 @@ Required environment:
 
 ```text
 PI_CURSOR_SETTING_SOURCES=none
+PI_CURSOR_LEAN=0
 PI_CURSOR_NATIVE_TOOL_DISPLAY=1
 PI_CURSOR_REGISTER_NATIVE_TOOLS=1
 PI_CURSOR_PI_TOOL_BRIDGE=0
 PI_CURSOR_EXPOSE_BUILTIN_TOOLS=0
 PI_CURSOR_SDK_EVENT_DEBUG=1
 ```
+
+This lane explicitly opts out of default lean mode so native SDK tools and replay registration are available. Inherited `PI_CURSOR_LEAN=1` cannot override the scenario.
 
 Purpose:
 
@@ -627,19 +631,21 @@ Required environment:
 
 ```text
 PI_CURSOR_SETTING_SOURCES=none
+PI_CURSOR_LEAN=1
 PI_CURSOR_HTTP_1_1=1
 PI_CURSOR_NATIVE_TOOL_DISPLAY=1
-PI_CURSOR_REGISTER_NATIVE_TOOLS=1
-PI_CURSOR_PI_TOOL_BRIDGE=0
-PI_CURSOR_EXPOSE_BUILTIN_TOOLS=0
+PI_CURSOR_REGISTER_NATIVE_TOOLS=0
+PI_CURSOR_PI_TOOL_BRIDGE=1
+PI_CURSOR_EXPOSE_BUILTIN_TOOLS=1
 PI_CURSOR_SDK_EVENT_DEBUG=1
 ```
 
 Purpose:
 
-- prove the packed extension completes a real local provider turn through the SDK's opt-in HTTP/1.1/SSE transport on every required OS;
+- prove the packed extension completes a real local provider turn through the SDK's opt-in HTTP/1.1/SSE transport on each selected OS;
 - prove the final TUI status visibly includes `cursor:local ... http1`;
-- keep the default transport covered by the other required live suites.
+- keep the default lean tool policy while testing transport; native replay has its own explicit opt-out lane;
+- use offline contracts or valid retained default-transport evidence rather than adding unrelated live runs.
 
 Required final marker: `HTTP1_LIVE_OK`.
 
@@ -653,8 +659,9 @@ Required environment:
 
 ```text
 PI_CURSOR_SETTING_SOURCES=none
+PI_CURSOR_LEAN=1
 PI_CURSOR_NATIVE_TOOL_DISPLAY=1
-PI_CURSOR_REGISTER_NATIVE_TOOLS=1
+PI_CURSOR_REGISTER_NATIVE_TOOLS=0
 PI_CURSOR_PI_TOOL_BRIDGE=1
 PI_CURSOR_EXPOSE_BUILTIN_TOOLS=1
 PI_CURSOR_PI_TOOL_BRIDGE_DEBUG=1
@@ -663,7 +670,7 @@ PI_CURSOR_SDK_EVENT_DEBUG=1
 
 Purpose:
 
-- prove pi bridge request routing;
+- prove pi bridge request routing under the default lean policy;
 - prove successful bridge tool card;
 - prove failed bridge tool card;
 - prove bridge shell card;
@@ -727,8 +734,9 @@ Required environment:
 
 ```text
 PI_CURSOR_SETTING_SOURCES=none
+PI_CURSOR_LEAN=1
 PI_CURSOR_NATIVE_TOOL_DISPLAY=1
-PI_CURSOR_REGISTER_NATIVE_TOOLS=1
+PI_CURSOR_REGISTER_NATIVE_TOOLS=0
 PI_CURSOR_PI_TOOL_BRIDGE=1
 PI_CURSOR_EXPOSE_BUILTIN_TOOLS=1
 PI_CURSOR_PI_TOOL_BRIDGE_DEBUG=1
@@ -737,7 +745,7 @@ PI_CURSOR_SDK_EVENT_DEBUG=1
 
 Purpose:
 
-- prove long-running bridge cancellation;
+- prove long-running bridge cancellation under the default lean policy;
 - prove no orphan processes;
 - prove no false successful answer.
 
@@ -796,9 +804,9 @@ cursor-local-resume-cleanup: 4
 
 Maximum per target: `37` Cursor invocations.
 
-Maximum full gate: `111` Cursor invocations.
+Declared maximum full matrix: `111` Cursor invocations (`37` per target across three targets). These are scenario budgets, not measured fixed billable model-call or SDK-step counts; actual service usage can differ.
 
-The merge gate is `npm run smoke:platform:all`; that script runs doctor first and then the matrix to preserve this budget. No suite adds a new Cursor invocation without updating this plan and the scenario source of truth (`scripts/platform-smoke/scenarios.mjs`, plus `scripts/platform-smoke/local-resume-suites.mjs` for local-resume lanes).
+`npm run smoke:platform:all` is optional comprehensive coverage; it runs doctor first and then the matrix within these declared budgets. Routine verification selects only necessary changed-behavior proof on one representative environment. No suite adds a new Cursor invocation without updating this plan and the scenario source of truth (`scripts/platform-smoke/scenarios.mjs`, plus `scripts/platform-smoke/local-resume-suites.mjs` for local-resume lanes).
 
 ## Artifact contract
 
@@ -982,16 +990,6 @@ Bridge diagnostics may include safe tool names and correlation IDs only.
 
 ## Release bar
 
-A local provider/runtime release is ready only after this exact command passes on the maintainer machine:
+Complete offline/faux verification and reuse valid exact-input retained proof. If changed behavior still needs real-service evidence, run the smallest meaningful existing check on one representative environment. Keep its assertions, visual proof when relevant, persisted session/debug evidence, and cleanup intact. Docs/metadata-only changes need no paid calls; optional unrun matrix lanes do not block landing.
 
-```bash
-npm run smoke:platform:all
-```
-
-Cloud-runtime releases additionally require:
-
-```bash
-npm run smoke:cloud
-```
-
-`smoke:platform:all` runs doctor first and then all required local targets and suites in one full gate execution.
+No paid Cloud testing for generic PRs/releases; only explicitly Cursor Cloud-focused PRs/issues may select necessary focused Cloud proof. The multi-lane Cloud command and `smoke:platform:all` remain optional comprehensive tools, not unconditional gates. No full paid campaign replay, matrix-only host coverage, or automatic paid retries. Automated Cursor PR reviews continue unchanged. Record exactly what passed, what retained evidence was reused, and any specific necessary proof still missing.

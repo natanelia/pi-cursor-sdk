@@ -1,78 +1,58 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import ts from "@typescript/typescript6";
 import { describe, expect, it } from "vitest";
 import { isCursorSdkConnectionStalledError, sanitizeCursorProviderError } from "../src/cursor-provider-errors.js";
-import { readInstalledPackageVersion, resolveInstalledPackageRoot } from "./helpers/installed-package.js";
+import { installedCursorModuleDeclarations, installedCursorModules } from "./helpers/cursor-sdk-installed-modules.js";
+import { readInstalledPackageVersion } from "./helpers/installed-package.js";
 
-const sdkRoot = resolveInstalledPackageRoot("@cursor/sdk");
-const installedSdkVersion = readInstalledPackageVersion("@cursor/sdk");
+const fixture = JSON.parse(readFileSync(
+	new URL("./fixtures/cursor-sdk-retriable-stalled-1.0.40.json", import.meta.url), "utf8",
+)) as {
+	provenance: { sdkPackage: string; sdkVersion: string; sourceFile: string; sourceSha256: string };
+	branches: Array<{
+		transportErrorRetries: number | null;
+		error: { name: string; kind: string; message: string; code: string; displayInfo: object };
+	}>;
+};
 
-interface RetriableStalledContractFixture {
-	provenance: {
-		sdkPackage: string;
-		sdkVersion: string;
-		verified: string;
-		sourceFile: string;
-		issues: string[];
-	};
-	errorShape: {
-		classKind: string;
-		name: string;
-		message: string;
-		displayInfo: {
-			title: string;
-			detailTemplate: string;
-			isRetryable: boolean;
-		};
-		alsoThrows: {
-			message: string;
-			when: string;
-		};
-	};
-	sourceMarkers: string[];
-	syntheticStackFrame: string;
+async function installedStallFactory() {
+	const modules = await installedCursorModules();
+	const source = modules.factorySource("./src/agent/local-executor.ts");
+	// Retain the distinct synchronous stall-callback provenance guard, without
+	// freezing minified names. This is a source contract, not a service recovery test.
+	expect(source).toContain("reportStall(");
+	expect(source).toContain("this.onStall?.()");
+	expect(source).toMatch(/onStall:\(\)=>\{[\w$]+\("stall_detector",\{thresholdMs:[\w$]+,advisoryThresholdMs:[\w$]+\}\),[\w$]+\(\)\}/);
+	const capturedSource = readFileSync(new URL(`../${fixture.provenance.sourceFile}`, import.meta.url), "utf8");
+	expect(capturedSource).toContain(source);
+	expect(createHash("sha256").update(capturedSource).digest("hex")).toBe(fixture.provenance.sourceSha256);
+	const { declarations, execute } = installedCursorModuleDeclarations(source);
+	const factories = [...declarations.values()].filter((node) => ts.isFunctionDeclaration(node) &&
+		node.getText().includes('"Connection stalled repeatedly"'));
+	if (factories.length !== 1) throw new Error("Installed stall factory changed");
+	const factory = factories[0]!;
+	return execute<(options: { cause: Error; requestId: string; connectCode: number; transportErrorRetries?: number }) =>
+		Error & { kind: string; code: string; displayInfo: object; requestId: string }>(factory);
 }
-
-function makeFixtureRetriableStalledError(
-	fixture: RetriableStalledContractFixture,
-	message: string,
-): Error & { kind: string } {
-	const error = new Error(message) as Error & { kind: string };
-	error.name = fixture.errorShape.name;
-	error.kind = fixture.errorShape.classKind;
-	error.stack = `${fixture.errorShape.name}: ${message}\n    ${fixture.syntheticStackFrame}`;
-	return error;
-}
-
-const fixture = JSON.parse(
-	readFileSync(new URL("./fixtures/cursor-sdk-retriable-stalled-1.0.27.json", import.meta.url), "utf8"),
-) as RetriableStalledContractFixture;
 
 describe("installed Cursor SDK RetriableError connection-stalled contract", () => {
-	it("matches installed @cursor/sdk 1.0.27 source markers and classifier shape", () => {
+	it("executes installed stall/retry branches and preserves cause, request, display and classifier provenance", async () => {
 		expect(fixture.provenance.sdkPackage).toBe("@cursor/sdk");
-		expect(fixture.provenance.sdkVersion).toBe(installedSdkVersion);
-		expect(installedSdkVersion).toBe("1.0.27");
-
-		const sourcePath = join(sdkRoot, "dist/esm/357.js");
-		const source = readFileSync(sourcePath, "utf8");
-		for (const marker of fixture.sourceMarkers) {
-			expect(source).toContain(marker);
-		}
-		expect(source).toContain(fixture.errorShape.displayInfo.title);
-		expect(source).toContain("Please check your network connection and try again.");
-		expect(source).toContain(fixture.errorShape.alsoThrows.message);
-
-		const messages = [fixture.errorShape.message, fixture.errorShape.alsoThrows.message] as const;
-		for (const message of messages) {
-			const error = makeFixtureRetriableStalledError(fixture, message);
-			expect(error.name).toBe("RetriableError");
-			expect(error.kind).toBe("RetriableError");
-			expect(error.message).toBe(message);
+		expect(fixture.provenance.sdkVersion).toBe(readInstalledPackageVersion("@cursor/sdk"));
+		const makeError = await installedStallFactory();
+		const cause = new Error("offline stall cause");
+		for (const branch of fixture.branches) {
+			const error = makeError({ cause, requestId: "offline-request", connectCode: 1,
+				transportErrorRetries: branch.transportErrorRetries ?? undefined });
+			expect({ name: error.name, kind: error.kind, message: error.message, code: error.code, displayInfo: error.displayInfo }).toEqual(branch.error);
+			expect(error.cause).toBe(cause);
+			expect(error.requestId).toBe("offline-request");
+			expect(error.stack).toMatch(/@cursor[\\/]sdk[\\/]dist[\\/]esm[\\/]/);
 			expect(isCursorSdkConnectionStalledError(error)).toBe(true);
 			const sanitized = sanitizeCursorProviderError(error, "test-key");
 			expect(sanitized.toLowerCase()).toContain("network error");
 			expect(sanitized).not.toMatch(/stalled(?: repeatedly)?/i);
 		}
-	});
+	}, 30_000);
 });

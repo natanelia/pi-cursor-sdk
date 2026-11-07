@@ -1,5 +1,7 @@
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { PassThrough } from "node:stream";
 import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -9,18 +11,22 @@ import {
 	DISCARDED_INCOMPLETE_TOOL_CALL_REASON,
 	CursorSdkEventDebugSink,
 	attachCursorSdkEventDebugPiStreamTap,
-	hashCursorSdkCallId,
 	recordDiscardedIncompleteStartedToolCall,
 	resolveCursorSdkEventDebugBaseDir,
 	resolveCursorSdkEventDebugEnabled,
-	serializeDiscardedIncompleteStartedToolCall,
 	__testUtils as sdkEventDebugTestUtils,
 } from "../src/cursor-sdk-event-debug.js";
-import { backfillPiSessionSnapshot, parseDebugProviderEventsArgs } from "../scripts/debug-provider-events.mjs";
+import { backfillPiSessionSnapshot, parseDebugProviderEventsArgs, runDebugProviderEvents } from "../scripts/debug-provider-events.mjs";
 import {
 	resolveCursorSettingSources,
 	serializeCursorSettingSources,
 } from "../shared/cursor-setting-sources.mjs";
+
+const providerProbeProcess = vi.hoisted(() => ({ spawn: vi.fn() }));
+vi.mock("node:child_process", async (importOriginal) => ({
+	...await importOriginal<typeof import("node:child_process")>(),
+	spawn: providerProbeProcess.spawn,
+}));
 
 describe("cursor sdk event debug sink", () => {
 	it("is disabled by default", () => {
@@ -35,7 +41,7 @@ describe("cursor sdk event debug sink", () => {
 		);
 	});
 
-	it("records raw payloads to disk without stderr by default", async () => {
+	it.each([false, true])("records raw payloads to disk with stderr summary enabled=%s", async (stderrEnabled) => {
 		const artifactDir = mkdtempSync(join(tmpdir(), "pi-cursor-sdk-event-debug-"));
 		const stderrLines: string[] = [];
 		const originalWrite = process.stderr.write.bind(process.stderr);
@@ -52,6 +58,7 @@ describe("cursor sdk event debug sink", () => {
 				env: {
 					PI_CURSOR_SDK_EVENT_DEBUG: "1",
 					PI_CURSOR_SDK_EVENT_DEBUG_RUN_DIR: artifactDir,
+					...(stderrEnabled ? { PI_CURSOR_SDK_EVENT_DEBUG_STDERR: "1" } : {}),
 				},
 			});
 			expect(sink?.artifactDir).toBe(artifactDir);
@@ -113,7 +120,7 @@ describe("cursor sdk event debug sink", () => {
 			});
 			expect(readFileSync(join(artifactDir, sdkEventDebugTestUtils.ARTIFACTS.timeline), "utf8")).toContain('"layer":"display-decisions"');
 			expect(readFileSync(join(artifactDir, sdkEventDebugTestUtils.ARTIFACTS.finalPartial), "utf8")).toContain('"toolUse"');
-			expect(stderrLines.some((line) => line.includes(CURSOR_SDK_EVENT_DEBUG_LOG_PREFIX))).toBe(false);
+			expect(stderrLines.some((line) => line.includes(CURSOR_SDK_EVENT_DEBUG_LOG_PREFIX))).toBe(stderrEnabled);
 		} finally {
 			process.stderr.write = originalWrite;
 			rmSync(artifactDir, { recursive: true, force: true });
@@ -237,34 +244,6 @@ describe("cursor sdk event debug sink", () => {
 			rmSync(artifactDir, { recursive: true, force: true });
 		}
 	});
-
-	it("can opt in to stderr summary output", async () => {
-		const artifactDir = mkdtempSync(join(tmpdir(), "pi-cursor-sdk-event-debug-"));
-		const stderrLines: string[] = [];
-		const originalWrite = process.stderr.write.bind(process.stderr);
-		process.stderr.write = ((chunk: string | Uint8Array) => {
-			stderrLines.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
-			return true;
-		}) as typeof process.stderr.write;
-
-		try {
-			const sink = CursorSdkEventDebugSink.maybeCreate({
-				cwd: "/repo",
-				modelId: "composer-2.5",
-				provider: "cursor",
-				env: {
-					PI_CURSOR_SDK_EVENT_DEBUG: "1",
-					PI_CURSOR_SDK_EVENT_DEBUG_RUN_DIR: artifactDir,
-					PI_CURSOR_SDK_EVENT_DEBUG_STDERR: "1",
-				},
-			});
-			await sink?.finalize();
-			expect(stderrLines.some((line) => line.includes(CURSOR_SDK_EVENT_DEBUG_LOG_PREFIX))).toBe(true);
-		} finally {
-			process.stderr.write = originalWrite;
-			rmSync(artifactDir, { recursive: true, force: true });
-		}
-	});
 });
 
 describe("cursor sdk event debug session grouping", () => {
@@ -346,6 +325,30 @@ describe("cursor sdk event debug session grouping", () => {
 			sdkEventDebugTestUtils.resetSessionDebugState();
 			scopeTestUtils.reset();
 			rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+
+	it("finalizes the captured session file even if another session binds before finalization", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-cursor-debug-binding-"));
+		const { __testUtils: scopeTestUtils } = await import("../src/cursor-session-scope.js");
+		sdkEventDebugTestUtils.resetSessionDebugState();
+		try {
+			const sessionA = join(root, "parent.jsonl");
+			const sessionB = join(root, "child.jsonl");
+			writeFileSync(sessionA, "parent journal\n");
+			writeFileSync(sessionB, "child journal\n");
+			scopeTestUtils.set(root, sessionA);
+			const sink = CursorSdkEventDebugSink.maybeCreate({ cwd: root, modelId: "gpt-5.5", provider: "cursor", env: { PI_CURSOR_SDK_EVENT_DEBUG: "1", PI_CURSOR_SDK_EVENT_DEBUG_DIR: join(root, "events") } });
+			scopeTestUtils.set(root, sessionB);
+			await sink!.finalize();
+			expect(readFileSync(join(sink!.artifactDir, sdkEventDebugTestUtils.ARTIFACTS.piSessionSnapshot), "utf8")).toBe("parent journal\n");
+			const manifest = JSON.parse(readFileSync(join(sink!.sessionDir!, sdkEventDebugTestUtils.SESSION_MANIFEST), "utf8"));
+			expect(manifest.sessionFile).toBe(sessionA);
+			expect(manifest.turns[0].summary.sessionFile).toBe(sessionA);
+		} finally {
+			sdkEventDebugTestUtils.resetSessionDebugState();
+			scopeTestUtils.reset();
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 
@@ -505,25 +508,6 @@ describe("cursor sdk event debug session grouping", () => {
 });
 
 describe("discarded incomplete started tool calls", () => {
-	it("hashes call ids without exposing raw values", () => {
-		expect(hashCursorSdkCallId("secret-call-id-123")).toMatch(/^[a-f0-9]{8}$/);
-		expect(hashCursorSdkCallId("secret-call-id-123")).toBe(hashCursorSdkCallId("secret-call-id-123"));
-		expect(hashCursorSdkCallId("secret-call-id-123")).not.toBe("secret-call-id-123");
-	});
-
-	it("serializes discarded incomplete started tool calls with bounded fields", () => {
-		expect(
-			serializeDiscardedIncompleteStartedToolCall({
-				toolName: "read",
-				callId: "call-abc",
-			}),
-		).toEqual({
-			event: "discarded-incomplete-started-tool-call",
-			toolName: "read",
-			callIdHash: hashCursorSdkCallId("call-abc"),
-			reason: DISCARDED_INCOMPLETE_TOOL_CALL_REASON,
-		});
-	});
 
 	it("records discarded incomplete started tool calls to coordinator-events.jsonl without stderr by default", async () => {
 		const artifactDir = mkdtempSync(join(tmpdir(), "pi-cursor-sdk-discarded-debug-"));
@@ -552,10 +536,15 @@ describe("discarded incomplete started tool calls", () => {
 			await sink?.finalize();
 
 			const coordinatorEvents = readFileSync(join(artifactDir, sdkEventDebugTestUtils.ARTIFACTS.coordinatorEvents), "utf8");
-			expect(coordinatorEvents).toContain('"phase":"discarded-incomplete-started-tool-call"');
-			expect(coordinatorEvents).toContain('"toolName":"read"');
-			expect(coordinatorEvents).toContain(`"callIdHash":"${hashCursorSdkCallId("call-abc")}"`);
-			expect(coordinatorEvents).toContain(`"reason":"${DISCARDED_INCOMPLETE_TOOL_CALL_REASON}"`);
+			expect(JSON.parse(coordinatorEvents.trim())).toMatchObject({
+				phase: "discarded-incomplete-started-tool-call",
+				payload: {
+					event: "discarded-incomplete-started-tool-call",
+					toolName: "read",
+					callIdHash: "313d0c18",
+					reason: DISCARDED_INCOMPLETE_TOOL_CALL_REASON,
+				},
+			});
 			expect(coordinatorEvents).not.toContain("call-abc");
 			expect(stderrLines.some((line) => line.includes("discarded-incomplete-started-tool-call"))).toBe(false);
 		} finally {
@@ -580,7 +569,7 @@ describe("discarded incomplete started tool calls", () => {
 			expect(line.startsWith(`${CURSOR_SDK_EVENT_DEBUG_LOG_PREFIX} `)).toBe(true);
 			expect(line).toContain('"event":"discarded-incomplete-started-tool-call"');
 			expect(line).toContain('"toolName":"read"');
-			expect(line).toContain(`"callIdHash":"${hashCursorSdkCallId("call-abc")}"`);
+			expect(line).toContain('"callIdHash":"313d0c18"');
 			expect(line).toContain(`"reason":"${DISCARDED_INCOMPLETE_TOOL_CALL_REASON}"`);
 			expect(line).not.toContain("call-abc");
 		} finally {
@@ -590,6 +579,59 @@ describe("discarded incomplete started tool calls", () => {
 });
 
 describe("debug-provider-events maintainer probe", () => {
+	it.each([
+		{ lean: undefined, nativeTools: undefined, display: undefined, bridge: undefined },
+		{ lean: "", nativeTools: undefined, display: undefined, bridge: undefined },
+		{ lean: "1", nativeTools: undefined, display: undefined, bridge: undefined },
+		{ lean: "0", nativeTools: undefined, display: undefined, bridge: undefined },
+		{ lean: undefined, nativeTools: "0", display: "0", bridge: "0" },
+		{ lean: "1", nativeTools: "0", display: "0", bridge: "0" },
+		{ lean: "0", nativeTools: "0", display: "0", bridge: "0" },
+	])("preserves capture policy with parent lean=$lean and nativeTools=$nativeTools", async ({ lean, nativeTools, display, bridge }) => {
+		const artifactDir = mkdtempSync(join(tmpdir(), "pi-cursor-debug-provider-env-"));
+		vi.stubEnv("CURSOR_API_KEY", "offline-probe-key");
+		vi.stubEnv("PI_CURSOR_LEAN", lean);
+		vi.stubEnv("PI_CURSOR_NATIVE_TOOLS", nativeTools);
+		vi.stubEnv("PI_CURSOR_NATIVE_TOOL_DISPLAY", display);
+		vi.stubEnv("PI_CURSOR_PI_TOOL_BRIDGE", bridge);
+		// Fake only the Pi process boundary: no extension, provider, or SDK turn runs.
+		const child = Object.assign(new EventEmitter(), {
+			stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+			exitCode: 0, signalCode: null,
+		});
+		child.stdin.on("data", () => child.stdout.write('{"type":"agent_settled"}\n'));
+		providerProbeProcess.spawn.mockReturnValueOnce(child);
+		try {
+			writeFileSync(join(artifactDir, "summary.json"), JSON.stringify({
+				artifactDir, artifacts: {}, counts: {}, elapsedMs: 0, waitResultRecorded: true,
+			}));
+			const args = parseDebugProviderEventsArgs([
+				"--cwd", artifactDir, "--out", artifactDir, "--prompt", "offline probe", "--setting-sources", "none",
+			]);
+
+			await expect(runDebugProviderEvents(args)).resolves.toMatchObject({ artifactDir });
+
+			expect(providerProbeProcess.spawn).toHaveBeenCalledOnce();
+			const childEnv = providerProbeProcess.spawn.mock.calls[0]![2].env as NodeJS.ProcessEnv;
+			expect(childEnv.PI_CURSOR_LEAN).toBe(lean || "0");
+			expect(childEnv.PI_CURSOR_NATIVE_TOOLS).toBe(nativeTools);
+			expect(childEnv.PI_CURSOR_NATIVE_TOOL_DISPLAY).toBe(display ?? "1");
+			expect(childEnv.PI_CURSOR_PI_TOOL_BRIDGE).toBe(bridge ?? "1");
+			expect(childEnv.PI_CURSOR_SETTING_SOURCES).toBe("none");
+			expect(process.env.PI_CURSOR_LEAN).toBe(lean);
+			expect(process.env.PI_CURSOR_NATIVE_TOOLS).toBe(nativeTools);
+			expect(process.env.PI_CURSOR_NATIVE_TOOL_DISPLAY).toBe(display);
+			expect(process.env.PI_CURSOR_PI_TOOL_BRIDGE).toBe(bridge);
+		} finally {
+			providerProbeProcess.spawn.mockReset();
+			child.stdin.destroy();
+			child.stdout.destroy();
+			child.stderr.destroy();
+			vi.unstubAllEnvs();
+			rmSync(artifactDir, { recursive: true, force: true });
+		}
+	});
+
 	it("backfills a missing pi session snapshot after pi exits", () => {
 		const baseDir = mkdtempSync(join(tmpdir(), "pi-cursor-debug-provider-backfill-"));
 		const artifactDir = join(baseDir, "artifacts");
@@ -656,7 +698,7 @@ describe("debug-provider-events maintainer probe", () => {
 		}
 	});
 
-	it("parses args and prompt file overrides", () => {
+	it("parses provider probe prompt and option overrides", () => {
 		expect(
 			parseDebugProviderEventsArgs(["--cwd", "/tmp/work", "--model", "cursor/composer-2.5", "--prompt", "hello"], {
 				CURSOR_API_KEY: "key",
@@ -669,18 +711,9 @@ describe("debug-provider-events maintainer probe", () => {
 		});
 	});
 
-	it("forwards explicit --setting-sources none to child pi env", () => {
+	it.each(["none", "  ,  "])("keeps disabled setting sources %j disabled through child env", (sources) => {
 		const args = parseDebugProviderEventsArgs(
-			["--prompt", "hello", "--setting-sources", "none"],
-			{ CURSOR_API_KEY: "key" },
-		);
-		expect(args.settingSources).toBeUndefined();
-		expect(serializeCursorSettingSources(args.settingSources)).toBe("none");
-	});
-
-	it("does not re-enable all when comma-only setting sources round-trip through child env", () => {
-		const args = parseDebugProviderEventsArgs(
-			["--prompt", "hello", "--setting-sources", "  ,  "],
+			["--prompt", "hello", "--setting-sources", sources],
 			{ CURSOR_API_KEY: "key" },
 		);
 		expect(args.settingSources).toBeUndefined();

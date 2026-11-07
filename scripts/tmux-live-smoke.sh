@@ -35,6 +35,10 @@ trap cleanup EXIT
 print_help() {
 	printf '%s\n' 'Partial live smoke runner for pi-cursor-sdk (subset of docs/cursor-live-smoke-checklist.md).
 
+Use offline checks and retained evidence first. This multi-check helper is optional;
+prefer one meaningful changed-behavior check on a representative environment.
+Every direct prompt is a single attempt; no automatic paid retries.
+
 Usage:
   ./scripts/tmux-live-smoke.sh
   SMOKE_DIR=/tmp/pi-cursor-smoke ./scripts/tmux-live-smoke.sh
@@ -47,11 +51,12 @@ Prerequisites:
   pi, node, npm, rg, tmux on PATH
   Resolved pi/node/npm/rg/tmux paths from the parent shell are reused in tmux-launched checks; pi shims run with the resolved node directory first on PATH.
   timeout or gtimeout optional; bash process-group kill fallback is used when absent
-  Child pi runs clear Cursor SDK event-debug env; isolated cases force PI_CURSOR_SETTING_SOURCES=none and default-settings unsets it.
+  Child pi runs clear Cursor SDK event-debug env; isolated cases force PI_CURSOR_SETTING_SOURCES=none without changing lean mode.
+  Only default-settings pins PI_CURSOR_LEAN=0 and unsets PI_CURSOR_SETTING_SOURCES to exercise legacy ambient settings.
 
 Coverage:
   - prereq model listing
-  - basic non-interactive prompt (retry-empty-output; strict output assertion)
+  - basic non-interactive prompt (single attempt; no automatic paid retries)
   - default ambient settings prompt (strict; no retry)
   - simple non-interactive math prompt (strict; no retry)
   - interactive TUI math/footer polling with cleanup
@@ -68,7 +73,7 @@ Not covered here:
 
 Options:
   -h, --help                    Show this help.
-  --self-test                   Run sealed PATH/env probes without live Cursor auth.
+  --self-test                   Run sealed PATH/env and single-attempt probes without live Cursor auth.
 
 Exit codes:
   0  all partial checks passed
@@ -84,7 +89,7 @@ build_smoke_env_arrays() {
 	DEBUG_ENV_UNSETS=( "${SMOKE_CURSOR_SDK_EVENT_DEBUG_ENV_UNSETS[@]}" )
 	BASE_ENV=( "$ENV_BIN" "${DEBUG_ENV_UNSETS[@]}" "PATH=$SEALED_PATH" )
 	NONE_ENV=( "$ENV_BIN" "${DEBUG_ENV_UNSETS[@]}" "PATH=$SEALED_PATH" PI_CURSOR_SETTING_SOURCES=none )
-	DEFAULT_ENV=( "$ENV_BIN" "${DEBUG_ENV_UNSETS[@]}" -u PI_CURSOR_SETTING_SOURCES "PATH=$SEALED_PATH" )
+	DEFAULT_ENV=( "$ENV_BIN" "${DEBUG_ENV_UNSETS[@]}" -u PI_CURSOR_SETTING_SOURCES "PATH=$SEALED_PATH" PI_CURSOR_LEAN=0 )
 }
 
 tail_file() {
@@ -110,103 +115,27 @@ assert_file_contains() {
 	fi
 }
 
-is_empty_retryable_exit() {
-	local code="$1"
-	local stdout="$2"
-	[[ ! -s "$stdout" && ( "$code" == "0" || "$code" == "124" || "$code" == "137" || "$code" == "143" ) ]]
-}
-
-run_direct_attempt() {
-	local name="$1"
-	local timeout_secs="$2"
-	local stdout="$3"
-	local stderr="$4"
-	shift 4
-	rm -f "$stdout" "$stderr"
-
-	if run_with_timeout "$timeout_secs" "$@" </dev/null >"$stdout" 2>"$stderr"; then
-		return 0
-	fi
-	return $?
-}
-
-run_direct_fail() {
-	local name="$1"
-	local code="$2"
-	local stdout="$3"
-	local stderr="$4"
-	local label="$5"
-	if [[ "$code" != "0" ]]; then
-		cat "$stderr" >&2 || true
-		fail "$name exited $code"
-	fi
-	printf '[smoke] %s missing %s in %s\n' "$name" "$label" "$stdout" >&2
-	printf '[smoke] %s stdout tail:\n' "$name" >&2
-	tail_file "$stdout" 120 >&2
-	printf '[smoke] %s stderr tail:\n' "$name" >&2
-	tail_file "$stderr" 80 >&2
-	fail "$name missing ${label}"
-}
-
 run_direct() {
 	local name="$1"
 	local timeout_secs="$2"
-	local policy="$3"
-	local expected_pattern="$4"
-	local expected_label="$5"
-	shift 5
+	local expected_pattern="$3"
+	local expected_label="$4"
+	shift 4
 	local stdout="$SMOKE_DIR/${name}.stdout.txt"
 	local stderr="$SMOKE_DIR/${name}.stderr.txt"
 	local code=0
 
-	if run_direct_attempt "$name" "$timeout_secs" "$stdout" "$stderr" "$@"; then
+	if run_with_timeout "$timeout_secs" "$@" </dev/null >"$stdout" 2>"$stderr"; then
 		code=0
 	else
 		code=$?
 	fi
-	if [[ "$code" == "0" ]] && "$RG_BIN" -q "$expected_pattern" "$stdout"; then
-		log "$name PASS"
-		return 0
+	if [[ "$code" != "0" ]]; then
+		cat "$stderr" >&2 || true
+		fail "$name exited $code"
 	fi
-
-	case "$policy" in
-		strict)
-			run_direct_fail "$name" "$code" "$stdout" "$stderr" "$expected_label"
-			;;
-		retry-empty-output)
-			local first_stdout="$SMOKE_DIR/${name}.attempt1.stdout.txt"
-			local first_stderr="$SMOKE_DIR/${name}.attempt1.stderr.txt"
-			if ! is_empty_retryable_exit "$code" "$stdout"; then
-				run_direct_fail "$name" "$code" "$stdout" "$stderr" "$expected_label"
-			fi
-			mv "$stdout" "$first_stdout" 2>/dev/null || true
-			mv "$stderr" "$first_stderr" 2>/dev/null || true
-			log "$name retrying once after empty output with exit $code"
-			if run_direct_attempt "$name" "$timeout_secs" "$stdout" "$stderr" "$@"; then
-				local retry_code=0
-				if "$RG_BIN" -q "$expected_pattern" "$stdout"; then
-					log "$name PASS after retry (first exit $code; first stderr: $first_stderr)"
-					return 0
-				fi
-				printf '[smoke] %s retry exited %s but still missed %s\n' "$name" "$retry_code" "$expected_label" >&2
-			else
-				local retry_code=$?
-				printf '[smoke] %s retry exited %s after first empty output exit %s\n' "$name" "$retry_code" "$code" >&2
-			fi
-			printf '[smoke] %s first stdout tail:\n' "$name" >&2
-			tail_file "$first_stdout" 80 >&2
-			printf '[smoke] %s first stderr tail:\n' "$name" >&2
-			tail_file "$first_stderr" 80 >&2
-			printf '[smoke] %s retry stdout tail:\n' "$name" >&2
-			tail_file "$stdout" 120 >&2
-			printf '[smoke] %s retry stderr tail:\n' "$name" >&2
-			tail_file "$stderr" 80 >&2
-			fail "$name retry failed after empty output"
-			;;
-		*)
-			fail "$name unknown run_direct policy: $policy (expected strict or retry-empty-output)"
-			;;
-	esac
+	assert_file_contains "$name" "$stdout" "$expected_pattern" "$expected_label"
+	log "$name PASS"
 }
 
 quote_command() {
@@ -331,7 +260,7 @@ capture_and_require_default_model() {
 }
 
 run_self_test() {
-	local temp_dir bin_dir fake_pi fake_node fake_node_marker fake_list_pi env_capture hostile_path captured_path node_dir name
+	local temp_dir bin_dir fake_pi fake_node fake_node_marker fake_list_pi env_capture hostile_path captured_path node_dir name lean_case
 	RG_BIN="$(command -v rg || true)"
 	temp_dir="$(mktemp -d /tmp/pi-cursor-sdk-live-smoke-self-test.XXXXXX)"
 	trap 'rm -rf "$temp_dir"' RETURN
@@ -379,10 +308,34 @@ EOF_SELFTEST_NODE
 		fi
 	done
 
-	PI_CURSOR_SETTING_SOURCES=all "${DEFAULT_ENV[@]}" "$fake_pi" --version
-	if grep -q '^PI_CURSOR_SETTING_SOURCES=' "$env_capture"; then
-		fail "self-test failed: default-settings env did not unset PI_CURSOR_SETTING_SOURCES"
-	fi
+	for lean_case in unset enabled; do
+		(
+			if [[ "$lean_case" == "unset" ]]; then
+				unset PI_CURSOR_LEAN
+			else
+				export PI_CURSOR_LEAN=1
+			fi
+			export PI_CURSOR_SETTING_SOURCES=all
+			"${DEFAULT_ENV[@]}" "$fake_pi" --version
+			[[ "$PI_CURSOR_SETTING_SOURCES" == "all" ]] || fail "self-test failed: default-settings changed parent setting sources"
+			grep -qx 'PI_CURSOR_LEAN=0' "$env_capture" || fail "self-test failed: default-settings did not opt out of $lean_case lean mode"
+			if grep -q '^PI_CURSOR_SETTING_SOURCES=' "$env_capture"; then
+				fail "self-test failed: default-settings env did not unset PI_CURSOR_SETTING_SOURCES"
+			fi
+
+			# Basic/math lanes must keep the default or inherited lean policy, not the ambient lane's opt-out.
+			"${NONE_ENV[@]}" "$fake_pi" --version
+			if [[ "$lean_case" == "unset" ]]; then
+				[[ -z "${PI_CURSOR_LEAN+x}" ]] || fail "self-test failed: default-settings changed unset parent lean mode"
+				if grep -q '^PI_CURSOR_LEAN=' "$env_capture"; then
+					fail "self-test failed: isolated env replaced default lean mode"
+				fi
+			else
+				[[ "${PI_CURSOR_LEAN-}" == "1" ]] || fail "self-test failed: default-settings changed enabled parent lean mode"
+				grep -qx 'PI_CURSOR_LEAN=1' "$env_capture" || fail "self-test failed: isolated env replaced inherited lean mode"
+			fi
+		)
+	done
 	# Large-catalog prereq: exercise the same capture_and_require_default_model helper.
 	fake_list_pi="$bin_dir/pi-list-models"
 	cat >"$fake_list_pi" <<'EOF_FAKE_LIST'
@@ -400,6 +353,45 @@ EOF_FAKE_LIST
 	if [[ "$(wc -l <"$temp_dir/prereq.models.txt" | tr -d ' ')" -lt 20000 ]]; then
 		fail "self-test failed: large catalog was truncated before search"
 	fi
+
+	# Exercise the real single-attempt path using an offline counting command.
+	local fake_direct="$bin_dir/direct" case_name exit_code output result
+	cat >"$fake_direct" <<'EOF_FAKE_DIRECT'
+#!/usr/bin/env bash
+printf 'called\n' >> "$1"
+printf 'retained stderr\n' >&2
+printf '%s' "$3"
+exit "$2"
+EOF_FAKE_DIRECT
+	chmod +x "$fake_direct"
+	for case_name in empty nonzero success; do
+		exit_code=0
+		output=""
+		[[ "$case_name" != "nonzero" ]] || exit_code=42
+		[[ "$case_name" == "empty" ]] || output="DIRECT_OK"
+		if ( SMOKE_DIR="$temp_dir" run_direct "$case_name" 10 DIRECT_OK DIRECT_OK "$fake_direct" "$temp_dir/$case_name.count" "$exit_code" "$output" ) >"$temp_dir/$case_name.result" 2>&1; then
+			result=0
+		else
+			result=$?
+		fi
+		[[ "$(wc -l <"$temp_dir/$case_name.count" | tr -d ' ')" == "1" ]] || fail "self-test failed: $case_name repeated the command"
+		[[ -f "$temp_dir/$case_name.stdout.txt" ]] || fail "self-test failed: $case_name lost stdout artifact"
+		grep -qx 'retained stderr' "$temp_dir/$case_name.stderr.txt" || fail "self-test failed: $case_name lost stderr artifact"
+		case "$case_name" in
+			empty)
+				[[ "$result" == "1" && ! -s "$temp_dir/$case_name.stdout.txt" ]] || fail "self-test failed: empty output did not fail"
+				grep -q 'missing DIRECT_OK' "$temp_dir/$case_name.result" || fail "self-test failed: empty output lost marker failure"
+				;;
+			nonzero)
+				[[ "$result" == "1" ]] || fail "self-test failed: nonzero command did not fail"
+				grep -q 'exited 42' "$temp_dir/$case_name.result" || fail "self-test failed: command exit code was lost"
+				;;
+			success)
+				[[ "$result" == "0" ]] || fail "self-test failed: valid output did not pass"
+				;;
+		esac
+		[[ "$case_name" == "empty" ]] || grep -qx DIRECT_OK "$temp_dir/$case_name.stdout.txt" || fail "self-test failed: $case_name lost output"
+	done
 
 	printf '[smoke] self-test PASS\n'
 }
@@ -451,19 +443,19 @@ log "partial live smoke: prereq, basic, default-settings, noninteractive-math, t
 capture_and_require_default_model "${NONE_ENV[@]}" "${PI_BASE[@]}" --list-models cursor
 log "prereq PASS"
 
-run_direct basic 600 retry-empty-output "PI_CURSOR_SMOKE_OK" "PI_CURSOR_SMOKE_OK" \
+run_direct basic 600 "PI_CURSOR_SMOKE_OK" "PI_CURSOR_SMOKE_OK" \
 	"${NONE_ENV[@]}" "${PI_BASE[@]}" \
 	--session-dir "$SMOKE_DIR/basic" \
 	--no-tools \
 	-p 'Live smoke. Reply exactly: PI_CURSOR_SMOKE_OK'
 
-run_direct default-settings 300 strict "PRODUCT=42" "PRODUCT=42" \
+run_direct default-settings 300 "PRODUCT=42" "PRODUCT=42" \
 	"${DEFAULT_ENV[@]}" "${PI_BASE[@]}" \
 	--session-dir "$SMOKE_DIR/default-settings" \
 	--no-tools \
 	-p 'Default settings smoke. Include PRODUCT=42 in the final answer.'
 
-run_direct noninteractive-math 300 strict "SUM=42" "SUM=42" \
+run_direct noninteractive-math 300 "SUM=42" "SUM=42" \
 	"${NONE_ENV[@]}" "${PI_BASE[@]}" \
 	--session-dir "$SMOKE_DIR/noninteractive-math" \
 	--no-tools \

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 const artifactsModule = "../scripts/platform-smoke/artifacts.mjs";
 
@@ -31,6 +31,192 @@ function encodeBinaryText(value: string, encoding: "utf16le" | "utf16be" | "utf3
 }
 
 describe("platform smoke artifact transport", () => {
+	// Cold native compilation has a 30s cap; keep it outside individual test deadlines.
+	beforeAll(async () => {
+		if (process.platform === "win32") return;
+		const { extractPlatformArtifactBundle, formatPlatformArtifactBundle } = await import(artifactsModule);
+		const out = mkdtempSync(join(tmpdir(), "platform-extractor-ready-"));
+		try {
+			const content = Buffer.from("ready");
+			expect(extractPlatformArtifactBundle(out, formatPlatformArtifactBundle({ files: [
+				{ path: "ready.txt", size: content.length, contentBase64: content.toString("base64") },
+			] })).ok).toBe(true);
+		} finally {
+			rmSync(out, { recursive: true, force: true });
+		}
+	}, 35_000);
+
+	const duplicateSecret = "credential-free-review-secret-123456789";
+	const duplicateCases = [
+		{ name: "auth field", text: `{"apiKey":"${duplicateSecret}","apiKey":"placeholder"}`, violation: "potential auth/token assignment" },
+		{ name: "escaped key and value", text: String.raw`{"api\u004bey":"credential-free-review-\u0073ecret-123456789","apiKey":"placeholder"}`, violation: "potential auth/token assignment" },
+		{ name: "overwritten container", text: `{"nested":[{"apiKey":"${duplicateSecret}"}],"nested":{}}`, violation: "potential auth/token assignment" },
+		{ name: "numeric token", text: '{"token":123456789012,"token":1}', violation: "potential auth/token assignment" },
+		{ name: "numeric overflow", text: `{"token":${"7".repeat(400)},"token":1}`, violation: "potential auth/token assignment" },
+		{ name: "bearer in array", text: `[{"text":"Bearer ${duplicateSecret}","text":null}]`, violation: "potential bearer token" },
+		{ name: "credential URL", text: '{"url":"https://user:password@example.com/repo","url":"@scope/pkg"}', violation: "potential credential-bearing URL" },
+		{ name: "literal escaped value", text: String.raw`{"value":"credential-free-review-\u0073ecret-123456789","value":false}`, violation: "CURSOR_API_KEY literal found" },
+		{ name: "literal escaped key in overwritten object", text: String.raw`{"nested":{"credential-free-review-\u0073ecret-123456789":1},"nested":[]}`, violation: "CURSOR_API_KEY literal found" },
+	].flatMap((fixture) => [false, true]
+		.filter((withEnv) => withEnv || fixture.violation !== "CURSOR_API_KEY literal found")
+		.map((withEnv) => ({ ...fixture, withEnv })));
+
+	it.each(["metadata.json", "session.jsonl"])("never bundles overwritten secret members in %s", async (path) => {
+		const { buildPlatformArtifactBundle, extractPlatformArtifactBundle, formatPlatformArtifactBundle } = await import(artifactsModule);
+		for (const fixture of duplicateCases) {
+			vi.stubEnv("CURSOR_API_KEY", fixture.withEnv ? duplicateSecret : undefined);
+			const root = mkdtempSync(join(tmpdir(), "platform-duplicate-source-"));
+			const out = mkdtempSync(join(tmpdir(), "platform-duplicate-out-"));
+			try {
+				writeFileSync(join(root, path), fixture.text + "\n");
+				const bundle = buildPlatformArtifactBundle(root, "evidence");
+				expect.soft(bundle.files.map((file: { path: string }) => file.path), fixture.name).toEqual(["evidence/bundle-redaction-violations.json"]);
+				const result = extractPlatformArtifactBundle(out, formatPlatformArtifactBundle(bundle));
+				if (process.platform !== "win32") expect.soft(result.violations, fixture.name).toContainEqual({ file: path, violation: fixture.violation });
+				expect.soft(existsSync(join(out, "evidence", path)), fixture.name).toBe(false);
+			} finally {
+				vi.unstubAllEnvs();
+				rmSync(root, { recursive: true, force: true });
+				rmSync(out, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it.each(["metadata.json", "session.jsonl"])("rejects overwritten secrets during validation and forged-envelope extraction of %s", async (path) => {
+		const { extractPlatformArtifactBundle, formatPlatformArtifactBundle, PLATFORM_ARTIFACT_BUNDLE_START, PLATFORM_ARTIFACT_BUNDLE_END } = await import(artifactsModule);
+		for (const fixture of duplicateCases) {
+			vi.stubEnv("CURSOR_API_KEY", fixture.withEnv ? duplicateSecret : undefined);
+			const out = mkdtempSync(join(tmpdir(), "platform-duplicate-forged-"));
+			try {
+				const content = Buffer.from(fixture.text + "\n");
+				const bundle = { files: [
+					{ path: "evidence/first.txt", size: 4, contentBase64: Buffer.from("safe").toString("base64") },
+					{ path: `evidence/${path}`, size: content.length, contentBase64: content.toString("base64") },
+				] };
+				// The formatter invokes bundle validation; bypass it to test the receiver independently.
+				expect.soft(() => formatPlatformArtifactBundle(bundle), fixture.name).toThrow();
+				const compressed = gzipSync(Buffer.from(JSON.stringify(bundle)));
+				const envelope = `${PLATFORM_ARTIFACT_BUNDLE_START}\n${JSON.stringify({
+					encoding: "gzip-base64", size: compressed.length,
+					sha256: createHash("sha256").update(compressed).digest("hex"), contentBase64: compressed.toString("base64"),
+				})}\n${PLATFORM_ARTIFACT_BUNDLE_END}\n`;
+				expect.soft(extractPlatformArtifactBundle(out, envelope).ok, fixture.name).toBe(false);
+				expect.soft(readdirSync(out), fixture.name).toEqual([]);
+			} finally {
+				vi.unstubAllEnvs();
+				rmSync(out, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it.each(["metadata.json", "session.jsonl"])("final-scans all overwritten members in retained %s", async (path) => {
+		const { scanArtifacts } = await import(artifactsModule);
+		const root = mkdtempSync(join(tmpdir(), "platform-duplicate-scan-"));
+		try {
+			for (const fixture of duplicateCases) {
+				vi.stubEnv("CURSOR_API_KEY", fixture.withEnv ? duplicateSecret : undefined);
+				writeFileSync(join(root, path), fixture.text + "\n");
+				expect.soft(scanArtifacts(root), fixture.name).toContainEqual({ file: path, violation: fixture.violation });
+			}
+		} finally {
+			vi.unstubAllEnvs();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("retains benign duplicate members, scoped IDs and escaped docs byte-for-byte", async () => {
+		const { buildPlatformArtifactBundle, extractPlatformArtifactBundle, formatPlatformArtifactBundle, scanArtifacts } = await import(artifactsModule);
+		const root = mkdtempSync(join(tmpdir(), "platform-benign-duplicate-"));
+		const out = mkdtempSync(join(tmpdir(), "platform-benign-duplicate-out-"));
+		// Container punctuation must end scalar auth context, not label array elements as tokens.
+		const document = String.raw`{"apiKey":["ordinary-long-identifier"],"api\u004bey":{},"ownerToken":1,"ownerToken":2,"name":"@scope/first","name":"@scope/second","docs":"apiKey=\"placeholder\" CURSOR_API_KEY=\"your-key\"","nested":[{"id":"agent-first","id":"agent-second"}],"empty":null,"enabled":true,"count":-1.25e+2}`;
+		const record = { ownerToken: 1, packageName: "@scope/package", text: 'CURSOR_API_KEY="your-key" apiKey="placeholder"', usage: { input: 3 }, id: "agent-fixture" };
+		const inputs = {
+			"metadata.json": document + "\n",
+			"session.jsonl": `${document}\r\n\r\n["@scope/pkg",null,false,42,{"apiKey":[],"id":"agent-fixture"}]\r\n`,
+			"pretty.json": JSON.stringify(record, null, 2) + "\n",
+			"ordinary.jsonl": [record, { type: "compaction", summary: record.text }, { type: "message", message: { role: "assistant", content: [] } }].map(value => JSON.stringify(value)).join("\r\n") + "\r\n",
+		};
+		try {
+			for (const [path, content] of Object.entries(inputs)) writeFileSync(join(root, path), content);
+			expect(scanArtifacts(root)).toEqual([]);
+			const bundle = buildPlatformArtifactBundle(root, "evidence");
+			expect(bundle.files).toHaveLength(4);
+			const result = extractPlatformArtifactBundle(out, formatPlatformArtifactBundle(bundle));
+			expect(result.ok).toBe(process.platform !== "win32");
+			if (process.platform !== "win32") {
+				for (const [path, content] of Object.entries(inputs)) expect(readFileSync(join(out, "evidence", path))).toEqual(Buffer.from(content));
+				expect(JSON.parse(readFileSync(join(out, "evidence/pretty.json"), "utf8"))).toEqual(record);
+				expect(result.violations).toEqual([]);
+				expect(scanArtifacts(out)).toEqual([]);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(out, { recursive: true, force: true });
+		}
+	});
+
+	it("fails qualification on malformed structured artifacts without repairing or dropping rows", async () => {
+		const { extractPlatformArtifactBundle, formatPlatformArtifactBundle, scanArtifacts } = await import(artifactsModule);
+		const { finalizeSuiteArtifacts } = await import("../scripts/platform-smoke/target-runtime.mjs" as string);
+		const root = mkdtempSync(join(tmpdir(), "platform-malformed-"));
+		const inputs = { "metadata.json": '{"ownerToken":[redacted]}', "session.jsonl": '{"type":"session"}\n{"broken":\n{"type":"message"}\n' };
+		try {
+			const files = Object.entries(inputs).map(([path, text]) => ({ path, size: Buffer.byteLength(text), contentBase64: Buffer.from(text).toString("base64") }));
+			const result = extractPlatformArtifactBundle(root, formatPlatformArtifactBundle({ files }));
+			expect(result.ok).toBe(false);
+			if (process.platform === "win32") return;
+			for (const [path, content] of Object.entries(inputs)) expect(readFileSync(join(root, path), "utf8")).toBe(content);
+			expect(scanArtifacts(root)).toContainEqual({ file: "metadata.json", violation: "invalid JSON" });
+			expect(scanArtifacts(root)).toContainEqual({ file: "session.jsonl", violation: "invalid JSONL at line 2" });
+			const finalized = finalizeSuiteArtifacts(root, [{ id: "scenario", fn: () => true }], {}, Object.keys(inputs));
+			expect(finalized.assertions.ok).toBe(false);
+			expect(finalized.assertions.checks).toContainEqual(expect.objectContaining({ id: "structured-artifacts-parseable", ok: false }));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("scans decoded JSON scalars and auth fields without classifying ordinary identifiers as credentials", async () => {
+		const { scanArtifactSecrets } = await import("../scripts/platform-smoke/artifact-secrets.mjs" as string);
+		const secret = "fixture-secret-123456789";
+		vi.stubEnv("CURSOR_API_KEY", secret);
+		try {
+			for (const value of [
+				{ apiKey: 'abcdefghijkl\\"mnopqrst' }, { accessToken: "abcdefghijklmnop" },
+				{ cookie: "abcdefghijklmnop" }, { session: "abcdefghijklmnop" }, { token: 123456789012 },
+				{ nested: [{ text: `Bearer ${secret}` }] }, { [secret]: "ordinary" },
+				{ url: "https://user:password@example.com/repo" }, { url: "user:password@example.com:repo" },
+			]) expect(scanArtifactSecrets("metadata.json", Buffer.from(JSON.stringify(value))).length).toBeGreaterThan(0);
+			expect(scanArtifactSecrets("session.jsonl", '{"text":"fixture-\\u0073ecret-123456789"}\n')).toContain("CURSOR_API_KEY literal found");
+			expect(scanArtifactSecrets("metadata.json", '{"ownerToken":1,"name":"@scope/pkg","id":"agent-fixture","enabled":true,"empty":null}')).toEqual([]);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	it("still redacts log secrets and rejects secret-bearing structured transport before writing", async () => {
+		const { buildPlatformArtifactBundle, extractPlatformArtifactBundle, formatPlatformArtifactBundle, redactSecrets, scanForSecrets } = await import(artifactsModule);
+		const root = mkdtempSync(join(tmpdir(), "platform-structured-secret-"));
+		const out = mkdtempSync(join(tmpdir(), "platform-structured-secret-out-"));
+		try {
+			const secret = "credential-free-token-123456789";
+			const text = `Authorization: Bearer ${secret}`;
+			expect(redactSecrets(text)).not.toContain(secret);
+			expect(scanForSecrets(redactSecrets(text))).toEqual([]);
+			for (const name of ["metadata.json", "session.jsonl"]) writeFileSync(join(root, name), JSON.stringify({ apiKey: secret }) + "\n");
+			const bundle = buildPlatformArtifactBundle(root, "evidence");
+			expect(bundle.files.map((file: { path: string }) => file.path)).toEqual(["evidence/bundle-redaction-violations.json"]);
+			const result = extractPlatformArtifactBundle(out, formatPlatformArtifactBundle(bundle));
+			if (process.platform !== "win32") expect(result.violations.length).toBeGreaterThan(0);
+			expect(existsSync(join(out, "evidence/metadata.json"))).toBe(false);
+			expect(existsSync(join(out, "evidence/session.jsonl"))).toBe(false);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(out, { recursive: true, force: true });
+		}
+	});
+
 	it("detects a Cursor key in binary artifacts and never transports or extracts the binary", async () => {
 		const { buildPlatformArtifactBundle, extractPlatformArtifactBundle, formatPlatformArtifactBundle, scanArtifacts } = await import(artifactsModule);
 		const root = mkdtempSync(join(tmpdir(), "platform-binary-secret-"));
@@ -349,44 +535,62 @@ while (true) {
 		}
 	}, 20_000);
 
-	it.skipIf(process.platform === "win32")("round-trips local-resume session, debug, and runtime evidence through the canonical bundle", () => {
-		const code = String.raw`
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { buildPlatformArtifactBundle, extractPlatformArtifactBundle, formatPlatformArtifactBundle } from "./scripts/platform-smoke/artifacts.mjs";
-const root = mkdtempSync(join(tmpdir(), "local-resume-bundle-source-"));
-const out = mkdtempSync(join(tmpdir(), "local-resume-bundle-out-"));
-try {
-  mkdirSync(join(root, "sessions"), { recursive: true });
-  mkdirSync(join(root, "debug", "sessions", "s1"), { recursive: true });
-  writeFileSync(join(root, "sessions", "session.jsonl"), "{}\n");
-  writeFileSync(join(root, "debug", "sessions", "s1", "session.json"), JSON.stringify({ payload: "x".repeat(100_000) }) + "\n");
-  writeFileSync(join(root, "runtime-launches.jsonl"), JSON.stringify({ extensionPath: "/packed/node_modules/pi-cursor-sdk" }) + "\n");
-  const payload = buildPlatformArtifactBundle(root, "local-resume-evidence");
-  const stdout = formatPlatformArtifactBundle(payload);
-  const extracted = extractPlatformArtifactBundle(out, stdout);
-  const runtime = readFileSync(join(out, "local-resume-evidence", "runtime-launches.jsonl"), "utf8");
-  const result = {
-    ok: extracted.ok,
-    session: readFileSync(join(out, "local-resume-evidence", "sessions", "session.jsonl"), "utf8") === "{}\n",
-    debug: JSON.parse(readFileSync(join(out, "local-resume-evidence", "debug", "sessions", "s1", "session.json"), "utf8")).payload.length === 100_000,
-    packed: runtime.includes("/packed/node_modules/pi-cursor-sdk"),
-    boundedLines: Math.max(...stdout.split("\n").map((line) => line.length)) < 32768,
-  };
-  console.log(JSON.stringify(result));
-  if (!Object.values(result).every(Boolean)) process.exit(1);
-} finally {
-  rmSync(root, { recursive: true, force: true });
-  rmSync(out, { recursive: true, force: true });
-}
-`;
-		const result = run(process.execPath, ["--input-type=module", "-e", code]);
-		expect(result.status).toBe(0);
-		expect(result.stdout).toContain('"packed":true');
+	it.skipIf(process.platform === "win32")("round-trips local-resume session, debug, and runtime evidence through the canonical bundle", async () => {
+		const { buildPlatformArtifactBundle, extractPlatformArtifactBundle, formatPlatformArtifactBundle } = await import(artifactsModule);
+		const root = mkdtempSync(join(tmpdir(), "local-resume-bundle-source-"));
+		const out = mkdtempSync(join(tmpdir(), "local-resume-bundle-out-"));
+		try {
+			mkdirSync(join(root, "sessions"), { recursive: true });
+			mkdirSync(join(root, "debug", "sessions", "s1"), { recursive: true });
+			writeFileSync(join(root, "sessions", "session.jsonl"), "{}\n");
+			writeFileSync(join(root, "debug", "sessions", "s1", "session.json"), JSON.stringify({ payload: "x".repeat(100_000) }) + "\n");
+			writeFileSync(join(root, "runtime-launches.jsonl"), JSON.stringify({ extensionPath: "/packed/node_modules/pi-cursor-sdk" }) + "\n");
+			const stdout = formatPlatformArtifactBundle(buildPlatformArtifactBundle(root, "local-resume-evidence"));
+			expect(extractPlatformArtifactBundle(out, stdout).ok).toBe(true);
+			expect(readFileSync(join(out, "local-resume-evidence", "sessions", "session.jsonl"), "utf8")).toBe("{}\n");
+			expect(JSON.parse(readFileSync(join(out, "local-resume-evidence", "debug", "sessions", "s1", "session.json"), "utf8")).payload).toHaveLength(100_000);
+			expect(readFileSync(join(out, "local-resume-evidence", "runtime-launches.jsonl"), "utf8")).toContain("/packed/node_modules/pi-cursor-sdk");
+			expect(Math.max(...stdout.split("\n").map((line: string) => line.length))).toBeLessThan(32768);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(out, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds actual gzip output at the public compressed bundle cap", () => {
+		const script = `
+			import assert from 'node:assert/strict';
+			import zlib from 'node:zlib';
+			import { syncBuiltinESMExports } from 'node:module';
+			const { MAX_COMPRESSED_BUNDLE_BYTES } = await import('./scripts/platform-smoke/artifact-bundle-contract.mjs');
+			const original = zlib.gzipSync;
+			let calls = 0;
+			zlib.gzipSync = (input, options) => {
+				assert.equal(options.maxOutputLength, MAX_COMPRESSED_BUNDLE_BYTES);
+				calls++;
+				return original(input, options);
+			};
+			syncBuiltinESMExports();
+			const { formatPlatformArtifactBundle } = await import('./scripts/platform-smoke/artifacts.mjs');
+			const output = formatPlatformArtifactBundle({ files: [{ path: 'evidence/result.txt', contentBase64: 'b2s=', size: 2 }] });
+			assert.equal(calls, 1);
+			assert.match(output, /gzip-base64/);
+			const failure = new Error('unrelated compressor failure');
+			zlib.gzipSync = () => { throw failure; };
+			syncBuiltinESMExports();
+			assert.throws(() => formatPlatformArtifactBundle({ files: [] }), error => error === failure);
+		`;
+		const result = run(process.execPath, ["--input-type=module", "-e", script]);
+		expect(result.status, result.stderr).toBe(0);
 	});
 
 	it("fails closed when the artifact writer exceeds count, aggregate, or compressed limits", async () => {
+		let phaseStarted = performance.now();
+		const recordPhase = (phase: string) => {
+			const now = performance.now();
+			if (process.env.CI) process.stderr.write(`artifact-writer-limits ${phase}: ${Math.round(now - phaseStarted)}ms\n`);
+			phaseStarted = now;
+		};
 		const artifactsModule = "../scripts/platform-smoke/artifacts.mjs";
 		const {
 			buildPlatformArtifactBundle,
@@ -396,18 +600,23 @@ try {
 			MAX_BUNDLE_FILE_COUNT,
 			writePlatformArtifactBundle,
 		} = await import(artifactsModule);
+		recordPhase("module-import");
 		const root = mkdtempSync(join(tmpdir(), "bundle-writer-limits-"));
 		const out = mkdtempSync(join(tmpdir(), "bundle-writer-limits-out-"));
 		const readLimitReasons = (bundle: { files: Array<{ contentBase64: string }> }) => JSON.parse(Buffer.from(bundle.files[0]!.contentBase64, "base64").toString("utf8")).reasons as string[];
 		try {
 			for (let index = 0; index <= MAX_BUNDLE_FILE_COUNT; index++) writeFileSync(join(root, `${index}.txt`), "x");
+			recordPhase("count-setup");
 			expect(readLimitReasons(buildPlatformArtifactBundle(root, "evidence"))).toContain("file-count");
+			recordPhase("count-build");
 
 			rmSync(root, { recursive: true, force: true });
 			mkdirSync(root, { recursive: true });
 			const content = Buffer.alloc(MAX_BUNDLE_FILE_BYTES, 65);
 			for (let index = 0; index <= MAX_BUNDLE_AGGREGATE_BYTES / MAX_BUNDLE_FILE_BYTES; index++) writeFileSync(join(root, `${index}.txt`), content);
+			recordPhase("aggregate-setup");
 			expect(readLimitReasons(buildPlatformArtifactBundle(root, "evidence"))).toContain("aggregate-bytes");
+			recordPhase("aggregate-build");
 
 			rmSync(root, { recursive: true, force: true });
 			mkdirSync(root, { recursive: true });
@@ -415,6 +624,7 @@ try {
 				const incompressibleText = randomBytes(3_375_000).toString("base64");
 				writeFileSync(join(root, `${index}.ansi`), incompressibleText);
 			}
+			recordPhase("compressed-setup");
 			let stdoutText = "";
 			const stdout = vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
 				stdoutText += chunk.toString();
@@ -426,12 +636,15 @@ try {
 			} finally {
 				stdout.mockRestore();
 			}
+			recordPhase("compressed-write");
 			expect(readLimitReasons(bundle)).toContain("platform artifact bundle exceeds compressed limit");
 			expect(extractPlatformArtifactBundle(out, stdoutText).ok).toBe(process.platform !== "win32");
 			expect(existsSync(join(out, "evidence", "bundle-limit-exceeded.json"))).toBe(process.platform !== "win32");
+			recordPhase("extract");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 			rmSync(out, { recursive: true, force: true });
+			recordPhase("cleanup");
 		}
 	}, 20_000);
 
@@ -447,8 +660,8 @@ try {
 			PLATFORM_ARTIFACT_BUNDLE_START,
 		} = await import(artifactsModule);
 		const out = mkdtempSync(join(tmpdir(), "bundle-extract-limits-"));
-		const envelope = (value: unknown) => {
-			const compressed = gzipSync(Buffer.from(JSON.stringify(value)));
+		const envelope = (value: unknown, whitespaceBytes = 0) => {
+			const compressed = gzipSync(Buffer.from(" ".repeat(whitespaceBytes) + JSON.stringify(value)), { level: 1 });
 			return `${PLATFORM_ARTIFACT_BUNDLE_START}\n${JSON.stringify({
 				encoding: "gzip-base64",
 				size: compressed.length,
@@ -457,26 +670,43 @@ try {
 			})}\n${PLATFORM_ARTIFACT_BUNDLE_END}\n`;
 		};
 		try {
-			expect(extractPlatformArtifactBundle(out, envelope({ files: [], padding: "x".repeat(MAX_INFLATED_BUNDLE_JSON_BYTES) })).ok).toBe(false);
+			// Legal JSON whitespace exceeds only the gunzip cap, not the bundle schema.
+			expect(extractPlatformArtifactBundle(out, envelope({ files: [] }, MAX_INFLATED_BUNDLE_JSON_BYTES)).ok).toBe(false);
+			expect(readdirSync(out)).toEqual([]);
 			expect(extractPlatformArtifactBundle(out, envelope({
 				files: Array.from({ length: MAX_BUNDLE_FILE_COUNT + 1 }, (_, index) => ({
 					path: `count/${index}.txt`, contentBase64: "", size: 0,
 				})),
 			})).ok).toBe(false);
-			expect(extractPlatformArtifactBundle(out, envelope({
-				files: Array.from({ length: Math.floor(MAX_BUNDLE_AGGREGATE_BYTES / MAX_BUNDLE_FILE_BYTES) + 1 }, (_, index) => ({
-					path: `aggregate/${index}.bin`, contentBase64: "", size: MAX_BUNDLE_FILE_BYTES,
-				})),
-			})).ok).toBe(false);
+			expect(readdirSync(out)).toEqual([]);
+			const content = Buffer.alloc(MAX_BUNDLE_FILE_BYTES - 1, 65);
+			const contentBase64 = content.toString("base64");
+			const files = Array.from({ length: Math.floor(MAX_BUNDLE_AGGREGATE_BYTES / content.length) }, (_, index) => ({
+				path: `aggregate/${index}.txt`, contentBase64, size: content.length,
+			}));
+			const tail = Buffer.alloc(MAX_BUNDLE_AGGREGATE_BYTES - files.length * content.length + 1, 65);
+			expect(extractPlatformArtifactBundle(out, envelope({ files: [
+				...files, { path: "aggregate/tail.txt", contentBase64: tail.toString("base64"), size: tail.length },
+			] })).ok).toBe(false);
+			expect(readdirSync(out)).toEqual([]);
 			expect(extractPlatformArtifactBundle(out, envelope({ files: [
 				{ path: "partial/first.txt", contentBase64: Buffer.from("first").toString("base64"), size: 5 },
 				{ path: "partial/second.txt", contentBase64: "not-base64", size: 3 },
 			] })).ok).toBe(false);
 			expect(existsSync(join(out, "partial", "first.txt"))).toBe(false);
+			expect(readdirSync(out)).toEqual([]);
+
+			// The large members are otherwise valid; Windows controllers reject nonempty extraction.
+			expect(extractPlatformArtifactBundle(out, envelope({ files }, 1)).ok).toBe(process.platform !== "win32");
+			if (process.platform !== "win32") {
+				for (const file of files) expect(readFileSync(join(out, file.path)).equals(content)).toBe(true);
+			} else {
+				expect(readdirSync(out)).toEqual([]);
+			}
 		} finally {
 			rmSync(out, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	it.skipIf(process.platform === "win32")("accepts only the exact root bundle path and rejects static and racing final symlinks", async () => {
 		const root = mkdtempSync(join(tmpdir(), "bundle-nofollow-test-"));
@@ -598,12 +828,14 @@ while (Date.now() < end) {
 			expect(readFileSync(outsideSentinel, "utf8")).toBe("outside-writer-sentinel");
 			const compressed = readFileSync(resolve(metadata.path));
 			const offsets: number[] = [];
+			const runOptions: unknown[] = [];
 			const chunkRun = (mutate?: (chunk: { offset: number; total: number; bytes: number; contentBase64: string }) => void) =>
-				async (_target: string, _lease: string, command: string[]) => {
+				async (_target: string, _lease: string, command: string[], options: unknown) => {
 					const option = (name: string) => command[command.indexOf(name) + 1]!;
 					const offset = Number(option("--offset"));
 					const length = Number(option("--length"));
 					offsets.push(offset);
+					runOptions.push(options);
 					const content = compressed.subarray(offset, offset + length);
 					const chunk = { offset, total: compressed.length, bytes: content.length, contentBase64: content.toString("base64") };
 					mutate?.(chunk);
@@ -612,6 +844,7 @@ while (Date.now() < end) {
 			const fetched = await fetchPlatformArtifactBundle("macos", "lease", marker, {}, chunkRun());
 			expect(fetched.ok).toBe(true);
 			expect(offsets).toEqual(Array.from({ length: Math.ceil(compressed.length / (32 * 1024)) }, (_, index) => index * 32 * 1024));
+			expect(runOptions).toEqual(offsets.map(() => ({ timeout: 120_000, sync: false, config: {} })));
 			expect(extractPlatformArtifactBundle(out, fetched.stdout).ok).toBe(process.platform !== "win32");
 			if (process.platform !== "win32") expect(readFileSync(join(out, "artifacts", "terminal.ansi"), "utf8")).toBe(terminal);
 

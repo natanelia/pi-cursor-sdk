@@ -1,14 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import { Text } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, Text } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import * as replay from "../src/cursor-native-tool-display-replay.js";
 import { wrapNativeCursorTool } from "../src/cursor-native-tool-display-tools.js";
+import { getCursorNativeToolDisplayState } from "../src/cursor-native-tool-display-state.js";
 import { createRenderContext, createRenderOptions, createRenderTheme } from "./helpers/render-fixtures.js";
 
 describe("wrapNativeCursorTool", () => {
 	it("does not use Cursor replay rendering for ordinary pi edit toolCallIds", () => {
-		const replaySpy = vi.spyOn(replay, "renderCursorReplayResult").mockReturnValue(new Text("", 0, 0));
 		const parameters = Type.Object({});
 		type EditToolDefinition = ToolDefinition<typeof parameters, unknown, unknown>;
 		const delegateRenderResult = vi.fn<NonNullable<EditToolDefinition["renderResult"]>>(() => new Text("pi edit", 0, 0));
@@ -20,13 +19,14 @@ describe("wrapNativeCursorTool", () => {
 			execute: vi.fn(async () => ({ content: [], details: undefined })),
 			renderResult: delegateRenderResult,
 		};
-		const wrapped = wrapNativeCursorTool(definition, () => definition);
+		const wrapped = wrapNativeCursorTool(definition, () => definition, getCursorNativeToolDisplayState());
 		const theme = createRenderTheme();
 
-		wrapped.renderResult?.(
+		const rendered = wrapped.renderResult?.(
 			{
 				content: [{ type: "text", text: "edit src/foo.ts" }],
 				details: {
+					variant: "nativeEdit",
 					path: "src/foo.ts",
 					diffString: "--- a\n+++ b\n",
 					linesAdded: 1,
@@ -38,8 +38,7 @@ describe("wrapNativeCursorTool", () => {
 			createRenderContext({ isError: false, toolCallId: "ordinary-edit-1" }),
 		);
 
-		expect(replaySpy).not.toHaveBeenCalled();
+		expect(rendered?.render(120).map(stripTerminalSequences).join("\n").trimEnd()).toBe("pi edit");
 		expect(delegateRenderResult).toHaveBeenCalledOnce();
-		replaySpy.mockRestore();
 	});
 });

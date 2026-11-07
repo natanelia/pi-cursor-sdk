@@ -137,39 +137,6 @@ describe("cursor-session-agent-resume", () => {
 		});
 	});
 
-	it("rejects a startup-persisted trailing user after a hard crash", async () => {
-		const pi = createPiHarness();
-		registerCursorSessionScope(pi);
-		registerCursorSessionAgentResume(pi);
-		const first = messageEntry("u1", null);
-		const branchHash = resumeTestUtils.hashBranchStep(resumeTestUtils.EMPTY_BRANCH_HASH, first);
-		const handle: CursorSessionAgentResumeEntryData = {
-			version: 1,
-			runtime: "local",
-			agentId: "agent-1",
-			scopeKey: "/tmp/session.jsonl",
-			sessionFile: "/tmp/session.jsonl",
-			sessionId: "session-1",
-			cwd: "/tmp/project",
-			poolKey: "pool-1",
-			branchPathHash: branchHash,
-			compactionGeneration: 0,
-			sendState: { bootstrapped: true, contextFingerprint: "fp", incrementalSendCount: 2 },
-			createdAt: "2026-07-07T00:00:00.000Z",
-		};
-		const crashedBranch = [first, resumeEntry("r1", "u1", handle), messageEntry("u2", "r1")];
-		const sessionManager = {
-			getSessionFile: vi.fn(() => "/tmp/session.jsonl"),
-			getSessionId: vi.fn(() => "session-1"),
-			getBranch: vi.fn(() => crashedBranch),
-		};
-
-		await pi.runSessionStart({ cwd: "/tmp/project", sessionManager });
-		await pi.runBeforeAgentStart({ cwd: "/tmp/project", sessionManager });
-
-		expect(getMatchingCursorSessionAgentResumeHandle("pool-1")).toBeUndefined();
-	});
-
 	it("rejects a prompt that Pi persisted before a hard-killed provider process exited", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "cursor-resume-hard-kill-"));
 		try {
@@ -336,7 +303,7 @@ describe("cursor-session-agent-resume", () => {
 			branchPathHash: futureHash,
 			sendState: { bootstrapped: true, contextFingerprint: "fp-new", incrementalSendCount: 1 },
 			createdAt: "2026-07-07T00:00:00.000Z",
-			storeIdentity: { version: 1, stateRoot: "/tmp/cursor-sdk-state" },
+			storeIdentity: { version: 1, stateRoot: "/tmp/cursor-sdk-state/workspace" },
 		};
 		const newerResume = resumeEntry("r2", "a2", newerHandle);
 		const treeUser = messageEntry("u3", "r1");
@@ -496,6 +463,10 @@ describe("cursor-session-agent-resume", () => {
 	});
 
 	it("clears restored handles on tree navigation and compaction", async () => {
+		const pi = createPiHarness();
+		registerCursorSessionScope(pi);
+		registerCursorSessionAgentResume(pi);
+		await pi.runSessionStart({ cwd: "/tmp/project", sessionManager: { getSessionFile: () => "/tmp/session.jsonl" } });
 		resumeTestUtils.set({
 			scopeKey: "/tmp/session.jsonl",
 			sessionFile: "/tmp/session.jsonl",
@@ -516,9 +487,6 @@ describe("cursor-session-agent-resume", () => {
 				createdAt: "2026-07-07T00:00:00.000Z",
 			},
 		});
-		const pi = createPiHarness();
-		registerCursorSessionAgentResume(pi);
-
 		await pi.runSessionTree();
 		expect(getMatchingCursorSessionAgentResumeHandle("pool-1")).toBeUndefined();
 
@@ -541,7 +509,7 @@ describe("cursor-session-agent-resume", () => {
 		expect(getMatchingCursorSessionAgentResumeHandle("pool-1")).toBeUndefined();
 	});
 
-	it("does not flush a compaction-summarizer pending handle on the first later turn_end", async () => {
+	it("invalidates an ordinary pending handle when compaction completes", async () => {
 		const pi = createPiHarness();
 		registerCursorSessionScope(pi);
 		registerCursorSessionAgentResume(pi);
@@ -568,12 +536,12 @@ describe("cursor-session-agent-resume", () => {
 		});
 		persistCursorSessionAgentResumeHandle({
 			runtime: "local",
-			agentId: "agent-summarizer",
+			agentId: "agent-conversation",
 			poolKey: "pool-1",
-			sendState: { bootstrapped: true, contextFingerprint: "one-message", incrementalSendCount: 0 },
+			sendState: { bootstrapped: true, contextFingerprint: "ordinary-context", incrementalSendCount: 0 },
 			storeIdentity: { version: 1, stateRoot: "/tmp/store" },
 		});
-		expect(resumeTestUtils.state.pendingHandle?.agentId).toBe("agent-summarizer");
+		expect(resumeTestUtils.state.pendingHandle?.agentId).toBe("agent-conversation");
 
 		await pi.runSessionCompact({
 			compactionEntry: compact,
@@ -586,7 +554,6 @@ describe("cursor-session-agent-resume", () => {
 			},
 		});
 		expect(resumeTestUtils.state.pendingHandle).toBeUndefined();
-		expect(resumeTestUtils.isResumeHandlePersistSuppressed()).toBe(false);
 
 		pi.appendEntry.mockClear();
 		await pi.runTurnEnd({}, {
@@ -597,5 +564,30 @@ describe("cursor-session-agent-resume", () => {
 			},
 		});
 		expect(pi.appendEntry).not.toHaveBeenCalled();
+	});
+
+	it("drops the ordinary pending handle at compaction start without disabling later conversation commits", async () => {
+		const manager = SessionManager.inMemory("/tmp/project");
+		const pi = createPiHarness();
+		pi.appendEntry.mockImplementation((type, data) => { manager.appendCustomEntry(type, data); });
+		registerCursorSessionScope(pi);
+		registerCursorSessionAgentResume(pi);
+		const ctx = { cwd: "/tmp/project", sessionManager: manager };
+		await pi.runSessionStart(ctx);
+		const pending = {
+			runtime: "local" as const, agentId: "agent-conversation", poolKey: "pool-1",
+			sendState: { bootstrapped: true, contextFingerprint: "ordinary-context", incrementalSendCount: 0 },
+			storeIdentity: { version: 1 as const, stateRoot: "/tmp/store" },
+		};
+		persistCursorSessionAgentResumeHandle(pending);
+		await pi.runSessionBeforeCompact();
+		await pi.runTurnEnd({}, ctx);
+		expect(manager.getEntries()).toHaveLength(0);
+		persistCursorSessionAgentResumeHandle(pending);
+		await pi.runTurnEnd({}, ctx);
+		expect(manager.getEntries()).toEqual([expect.objectContaining({
+			type: "custom", customType: CURSOR_SESSION_AGENT_RESUME_ENTRY_TYPE,
+			data: expect.objectContaining({ agentId: "agent-conversation", compactionGeneration: 0 }),
+		})]);
 	});
 });

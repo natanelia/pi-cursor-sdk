@@ -1,18 +1,12 @@
 import { spawnSync } from "node:child_process";
 import {
-	CURSOR_PI_TOOL_BRIDGE_DEBUG_ENV,
 	CURSOR_PI_TOOL_BRIDGE_DIAGNOSTIC_PREFIX,
 	type CursorPiToolBridgeDiagnosticEvent,
 	serializeCursorPiToolBridgeDiagnostic,
 } from "./cursor-pi-tool-bridge-diagnostics.js";
-import {
-	CURSOR_PI_TOOL_BRIDGE_BUILTINS_ENV,
-	CURSOR_PI_TOOL_BRIDGE_CALL_TIMEOUT_MS_ENV,
-	CURSOR_PI_TOOL_BRIDGE_ENV,
-} from "./cursor-pi-tool-bridge-env.js";
 import { bridgeToolExecutionAbortTracker } from "./cursor-pi-tool-bridge-abort.js";
-import { isCursorPiBridgeToolCallId, MCP_SERVER_NAME } from "./cursor-pi-tool-bridge-constants.js";
-import { LOOPBACK_HOST, CursorPiToolBridgeRegistry } from "./cursor-pi-tool-bridge-server.js";
+import { isCursorPiBridgeToolCallId } from "./cursor-pi-tool-bridge-constants.js";
+import { CursorPiToolBridgeRegistry } from "./cursor-pi-tool-bridge-server.js";
 import type {
 	CursorPiToolBridge,
 	CursorPiToolBridgeExtensionApi,
@@ -34,9 +28,6 @@ export type {
 export type { CursorPiToolBridgeDiagnosticEvent } from "./cursor-pi-tool-bridge-diagnostics.js";
 export { resolveCursorPiToolBridgeDebugEnabled } from "./cursor-pi-tool-bridge-diagnostics.js";
 export {
-	CURSOR_PI_TOOL_BRIDGE_BUILTINS_ENV,
-	CURSOR_PI_TOOL_BRIDGE_CALL_TIMEOUT_MS_ENV,
-	CURSOR_PI_TOOL_BRIDGE_ENV,
 	resolveCursorPiToolBridgeBuiltinsEnabled,
 	resolveCursorPiToolBridgeCallTimeoutMs,
 	resolveCursorPiToolBridgeEnabled,
@@ -46,6 +37,8 @@ export {
 	buildCursorPiToolBridgeSurfaceSignature,
 } from "./cursor-pi-tool-bridge-snapshot.js";
 
+const bridges = new Map<object, CursorPiToolBridgeRegistry>();
+const activeCallsByPi = new Map<object, Set<string>>();
 let registeredCursorPiToolBridge: CursorPiToolBridgeRegistry | undefined;
 
 const WINDOWS_BRIDGE_ABORT_ENV = "PI_CURSOR_BRIDGE_TOOL_CALL_ID";
@@ -89,17 +82,25 @@ Get-CimInstance Win32_Process -Filter "Name = 'bash.exe' OR Name = 'sh.exe'" |
 }
 
 export function registerCursorPiToolBridge(pi: CursorPiToolBridgeExtensionApi): CursorPiToolBridge {
-	bridgeToolExecutionAbortTracker.abortAll("Cursor pi tool bridge extension reloaded");
-	void registeredCursorPiToolBridge?.disposeAll("Cursor pi tool bridge extension reloaded");
+	const previous = bridges.get(pi);
+	if (previous) {
+		const reason = "Cursor pi tool bridge extension reloaded";
+		for (const id of activeCallsByPi.get(pi) ?? []) bridgeToolExecutionAbortTracker.abort(id, reason);
+		void previous.disposeAll(reason);
+	}
 	const bridge = new CursorPiToolBridgeRegistry(pi);
 	registeredCursorPiToolBridge = bridge;
+	bridges.set(pi, bridge);
+	const activeCalls = new Set<string>();
+	activeCallsByPi.set(pi, activeCalls);
 	pi.on("tool_call", (event, ctx) => {
-		if (registeredCursorPiToolBridge !== bridge) return undefined;
+		if (bridges.get(pi) !== bridge) return undefined;
 		if (!bridge.hasPendingPiToolCallId(event.toolCallId)) {
 			return isCursorPiBridgeToolCallId(event.toolCallId)
 				? { block: true, reason: "Cursor pi bridge tool call is no longer pending" }
 				: undefined;
 		}
+		activeCalls.add(event.toolCallId);
 		const windowsAbortMarker = installWindowsBridgeBashAbortMarker(event);
 		const trackingStarted = bridgeToolExecutionAbortTracker.track(event.toolCallId, {
 			signal: ctx.signal,
@@ -115,28 +116,27 @@ export function registerCursorPiToolBridge(pi: CursorPiToolBridgeExtensionApi): 
 		return { block: true, reason: "Cursor pi bridge tool execution was aborted before it started" };
 	});
 	pi.on("tool_result", (event) => {
-		bridgeToolExecutionAbortTracker.finish(event.toolCallId);
+		if (activeCalls.delete(event.toolCallId)) bridgeToolExecutionAbortTracker.finish(event.toolCallId);
 	});
 	pi.on("session_shutdown", async (event) => {
+		if (bridges.get(pi) !== bridge) return;
 		const reason = `Cursor pi tool bridge session shutdown: ${event.reason}`;
-		bridgeToolExecutionAbortTracker.abortAll(reason);
+		for (const id of activeCalls) bridgeToolExecutionAbortTracker.abort(id, reason);
+		activeCalls.clear();
+		bridges.delete(pi);
+		activeCallsByPi.delete(pi);
+		if (registeredCursorPiToolBridge === bridge) registeredCursorPiToolBridge = [...bridges.values()].at(-1);
 		await bridge.disposeAll(reason);
 	});
 	return bridge;
 }
 
-export function getRegisteredCursorPiToolBridge(): CursorPiToolBridge | undefined {
-	return registeredCursorPiToolBridge;
+export function getRegisteredCursorPiToolBridge(pi?: object): CursorPiToolBridge | undefined {
+	return pi ? bridges.get(pi) : registeredCursorPiToolBridge;
 }
 
 export const __testUtils = {
-	CURSOR_PI_TOOL_BRIDGE_ENV,
-	CURSOR_PI_TOOL_BRIDGE_BUILTINS_ENV,
-	CURSOR_PI_TOOL_BRIDGE_CALL_TIMEOUT_MS_ENV,
-	CURSOR_PI_TOOL_BRIDGE_DEBUG_ENV,
 	CURSOR_PI_TOOL_BRIDGE_DIAGNOSTIC_PREFIX,
-	LOOPBACK_HOST,
-	MCP_SERVER_NAME,
 	createRegistry(
 		pi: CursorPiToolBridgeSnapshotApi,
 		env: Record<string, string | undefined> = process.env,
@@ -153,14 +153,15 @@ export const __testUtils = {
 		return bridgeToolExecutionAbortTracker.getActiveCount();
 	},
 	buildWindowsBridgeBashAbortCommandForTests: buildWindowsBridgeBashAbortCommand,
-	installWindowsBridgeBashAbortMarkerForTests: installWindowsBridgeBashAbortMarker,
 	emitBridgeToolExecutionProcessAbortSignalForTests(signal: NodeJS.Signals) {
 		bridgeToolExecutionAbortTracker.emitProcessAbortSignalForTests(signal);
 	},
 	resetRegisteredBridgeForTests() {
 		bridgeToolExecutionAbortTracker.abortAll("Cursor pi tool bridge test reset");
-		const bridge = registeredCursorPiToolBridge;
+		const registered = [...bridges.values()];
+		bridges.clear();
+		activeCallsByPi.clear();
 		registeredCursorPiToolBridge = undefined;
-		return bridge?.disposeAll("Cursor pi tool bridge test reset") ?? Promise.resolve();
+		return Promise.all(registered.map((bridge) => bridge.disposeAll("Cursor pi tool bridge test reset")));
 	},
 };

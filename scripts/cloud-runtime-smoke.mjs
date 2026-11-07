@@ -84,18 +84,21 @@ class SmokeFailure extends Error {
 }
 
 function printHelp() {
-	console.log(`Required live Cursor cloud release smoke for pi-cursor-sdk.
+	console.log(`Explicit Cursor Cloud-focused live smoke for pi-cursor-sdk.
+
+No paid Cloud testing for generic PRs/releases. Only PRs/issues explicitly focused on Cursor Cloud may select necessary focused Cloud proof after offline checks and retained-evidence reuse. Automated Cursor PR reviews continue unchanged. The multi-lane matrix is optional, not an unconditional ship gate; no automatic paid retries.
 
 Usage:
   npm run smoke:cloud
   npm run smoke:cloud:context
   node scripts/cloud-runtime-smoke.mjs [--context-matrix]
 
-The no-flag release gate creates and deletes one private throwaway GitHub repository and runs named lanes for cancel, explicit repo/startingRef branch reporting, direct push, missing branch failure, lifecycle delete, and account-conditional artifacts/raw usage. It requires current gh auth with private-repo create/push/delete access and Cursor Cloud access to that repository.
+The optional no-flag matrix creates and deletes one private throwaway GitHub repository and runs named lanes for cancel, explicit repo/startingRef branch reporting, direct push, missing branch failure, lifecycle delete, and account-conditional artifacts/raw usage. It requires current gh auth with private-repo create/push/delete access and Cursor Cloud access to that repository.
 
 Environment:
   CURSOR_API_KEY                    Required for cloud runs and verified agent cleanup.
   CURSOR_CLOUD_SMOKE_TIMEOUT_MS     Timeout in ms per lane (default: 300000).
+  CURSOR_CLOUD_SMOKE_GH_CLI         GitHub CLI executable (default: gh).
   CURSOR_CLOUD_SMOKE_ENV_TYPE       Optional context-matrix Cursor env type: cloud, pool, or machine.
   CURSOR_CLOUD_SMOKE_ENV_NAME       Optional context-matrix env name, used only with type.
   CURSOR_CLOUD_SMOKE_KEEP_ARTIFACTS Keep temp artifacts after success when set to 1.
@@ -142,7 +145,8 @@ function optionalSmokeValue(name) {
 export function buildCloudSmokeEnv(artifactDir, options = {}) {
 	const agentDir = join(artifactDir, "agent");
 	mkdirSync(agentDir, { recursive: true });
-	const env = buildCursorSmokeEnv({ settingSources: "none", eventDebugDir: artifactDir });
+	// Lean is local-only; the Cloud harness must opt out even when the parent uses the default.
+	const env = buildCursorSmokeEnv({ settingSources: "none", lean: false, eventDebugDir: artifactDir });
 	for (const name of CLOUD_ENV_NAMES) delete env[name];
 	const smokeEnvType = options.repoUrl ? undefined : optionalSmokeValue("CURSOR_CLOUD_SMOKE_ENV_TYPE");
 	const smokeEnvName = options.repoUrl ? undefined : optionalSmokeValue("CURSOR_CLOUD_SMOKE_ENV_NAME");

@@ -1,5 +1,6 @@
 import type { McpServerConfig } from "@cursor/sdk";
-import type { Context, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { Context, Tool, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { Tool as McpTool } from "@modelcontextprotocol/server";
 import type { CursorSdkEventDebugRecorder } from "./cursor-sdk-event-debug.js";
 import type {
 	ExtensionAPI,
@@ -19,12 +20,7 @@ export type CursorPiToolBridgeExtensionApi = CursorPiToolBridgeSnapshotApi & {
 	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
 };
 
-export interface CursorPiMcpInputSchema {
-	type: "object";
-	properties?: Record<string, object>;
-	required?: string[];
-	[key: string]: unknown;
-}
+export type CursorPiMcpInputSchema = McpTool["inputSchema"];
 
 export interface CursorPiBridgeToolDefinition {
 	piToolName: string;
@@ -43,6 +39,8 @@ export interface CursorPiToolBridgeSnapshot {
 
 export interface CursorPiToolBridgeSnapshotOptions {
 	exposeOverlappingBuiltins?: boolean;
+	/** Effective native request declarations after Pi's prepareLoadout/context projection. */
+	declaredTools?: readonly Tool[];
 }
 
 export interface CursorPiBridgeToolRequest {
@@ -64,6 +62,9 @@ export interface CursorPiToolBridgeRun {
 	resolveToolResults(toolResults: readonly ToolResultMessage[]): Promise<void>;
 	resolveToolResultsFromContext(context: Context): Promise<void>;
 	hasPendingPiToolCallId(piToolCallId: string): boolean;
+	hasPendingToolCalls(): boolean;
+	/** Synchronous changes; observer errors cannot affect settlement. Returns an idempotent unsubscribe. */
+	onPendingToolCallsChanged(listener: () => void): () => void;
 	isBridgeMcpToolCall(toolCall: unknown): boolean;
 	setOnToolRequest(handler?: (request: CursorPiBridgeToolRequest) => void): void;
 	setDebugRecorder(recorder?: CursorSdkEventDebugRecorder): void;
@@ -73,12 +74,13 @@ export interface CursorPiToolBridgeRun {
 
 export interface CursorPiToolBridge {
 	isEnabled(): boolean;
-	getToolSurfaceSignature(): string;
+	getToolSurfaceSignature(declaredTools?: readonly Tool[]): string;
 	createRun(options?: CursorPiToolBridgeRunOptions): Promise<CursorPiToolBridgeRun>;
 	disposeAll(reason?: string): Promise<void>;
 }
 
 export interface CursorPiToolBridgeRunOptions {
+	declaredTools?: readonly Tool[];
 	onToolRequest?: (request: CursorPiBridgeToolRequest) => void;
 	debugRecorder?: CursorSdkEventDebugRecorder;
 }
